@@ -111,9 +111,9 @@
             <button id="btnAlignBar" class="btn-ghost btn-sm" title="Align clip downbeat to nearest bar 1 (A)">Align Bar 1 (A)</button>
           </div>
           <div class="eb-group">
-            <span class="hit-badge ok" style="font-size:10px;cursor:default" title="Runs 100% in your browser via Web Audio — no server needed">LIVE BROWSER DEMO</span>
-            <button id="btnResetDemo" class="btn-ghost btn-sm" title="Reset demo project & folders to defaults">Reset Demo</button>
-            <a href="https://github.com/Texmexdex/re-tex-core" target="_blank" rel="noopener" class="btn-ghost btn-sm" style="text-decoration:none;color:var(--text);border:1px solid var(--border);border-radius:5px">GitHub Repo</a>
+            <button id="btnBackendMode" class="hit-badge warn" style="font-size:10px" title="Click to connect to your Local PC backend or configure Zero-Install Browser AI separation">BROWSER LOCAL</button>
+            <button id="btnResetDemo" class="btn-ghost btn-sm" title="Reset demo & clear browser imports">Reset</button>
+            <a href="https://github.com/Texmexdex/re-tex-core" target="_blank" rel="noopener" class="btn-ghost btn-sm" style="text-decoration:none;color:var(--text);border:1px solid var(--border);border-radius:5px">GitHub</a>
             <span class="eb-sep"></span>
             <button id="btnUndo" class="btn-ghost btn-sm" title="Undo (Ctrl+Z)">Undo</button>
             <button id="btnRedo" class="btn-ghost btn-sm" title="Redo (Ctrl+Y)">Redo</button>
@@ -283,9 +283,48 @@
     </div>
   </div>
 
+  <!-- Backend Bridge & Zero-Install Browser Settings Modal -->
+  <div id="bridgeModal" class="modal hidden">
+    <div class="modal-card modal-sm" style="width:min(510px, 94vw)">
+      <div class="modal-head">
+        <div>
+          <h3>Backend Mode &amp; Local Storage</h3>
+          <div class="modal-sub">Proxy to your Local PC or run 100% Zero-Install in Chrome</div>
+        </div>
+        <button id="bmClose" class="btn-ghost">Close</button>
+      </div>
+      <div id="bmStatus" class="audit-banner warn" style="margin:12px 16px 0"></div>
+      <div class="modal-body">
+        <label class="field">
+          <span>Local PC Backend URL (run <code>Run Re-Tex Core.bat</code> on your PC for CUDA AI &amp; full library)</span>
+          <div style="display:flex;gap:6px">
+            <input id="bmLocalUrl" type="text" value="http://127.0.0.1:8770" style="flex:1;font-family:var(--mono)" />
+            <button id="bmConnectLocal" class="btn-accent">Connect Local PC</button>
+          </div>
+        </label>
+        <div style="height:1px;background:var(--border)"></div>
+        <label class="field">
+          <span>Zero-Install Browser <code>+ Import</code> Mode (stores stems privately on your SSD via IndexedDB)</span>
+          <select id="bmImportMode">
+            <option value="ai" selected>AI 4-Stem Split in Browser (HTDemucs ONNX — WebGPU GPU / WASM CPU)</option>
+            <option value="direct">Instant Direct Import (No AI split — full mix or single stem)</option>
+          </select>
+        </label>
+        <div id="bmHwInfo" class="modal-sub" style="line-height:1.45"></div>
+        <div style="display:flex;gap:6px;flex-wrap:wrap">
+          <button id="bmImportStemsBtn" class="btn-ghost btn-sm" title="Select 2-4 already-separated stem files (*drums*, *bass*, *other*, *vocals*) to import together">Import Pre-Separated Stems...</button>
+          <input id="bmMultiStemInput" type="file" multiple accept="audio/*,.wav,.flac,.mp3,.m4a,.ogg" hidden />
+          <button id="bmClearModel" class="btn-ghost btn-sm">Clear Cached AI Model</button>
+          <button id="bmUseBrowser" class="btn-ghost btn-sm">Force Browser Mode</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <!-- Toast stack -->
   <div id="toasts"></div>
 
+  <script src="./js/browser-dsp.js"></script>
   <script src="./js/demo-backend.js"></script>
   <script type="module" src="./js/main.js"></script>
 </body>

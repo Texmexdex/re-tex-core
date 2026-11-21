@@ -9,12 +9,21 @@ A lean, responsive multi-stem mashup DAW focused on the essentials that matter m
 </p>
 
 <p align="center">
-  <strong><a href="https://texmexdex.github.io/re-tex-core/">▶ Launch Live Interactive Browser Demo (GitHub Pages — No Install Needed)</a></strong>
+  <strong><a href="https://texmexdex.github.io/re-tex-core/">▶ Launch Re-Tex Core Web App (GitHub Pages — Local PC Proxy + Zero-Install Browser Mode)</a></strong>
   &nbsp;&middot;&nbsp;
   <a href="docs/demo_mashup.mp3">Listen to 30s Demo Bounce (MP3)</a>
 </p>
 
-> **Live Browser Demo (`docs/`):** Runs 100% client-side in Web Audio using a static faux backend (`docs/js/demo-backend.js`) with 2 pre-baked royalty-free 4-stem tracks — press **Space** to play live, toggle **Quantize** to compare raw drifting vs. `0.0 ms` quantized drums, test **Split (`S`)**, **Duplicate After (`Ctrl+D`)**, real-time **Per-Stem Pitch (`AudioWorklet`)**, **Beat Grid & Hit Audit**, and real **in-browser WAV Export**!
+## Two Modes in the Hosted Web App (`docs/`)
+
+Opening **`https://texmexdex.github.io/re-tex-core/`** works in two seamless, 100% private modes (click the **`BROWSER LOCAL` / `LOCAL PC CONNECTED`** pill in the toolbar to configure or switch):
+
+1. **Local PC Proxy Window (`LOCAL PC CONNECTED`)** — If **`Run Re-Tex Core.bat`** is running on your computer (`http://127.0.0.1:8770`), the hosted page automatically detects it via `/api/health` (with Chrome Private Network Access + CORS headers) and acts as a live frontend window into your local PC backend — full local library, CUDA Mel-Band Roformer / BS-Roformer separation, Rubber Band R3 warping, and `-12 LUFS` MP3/WAV export with zero audio ever leaving your machine.
+2. **Zero-Install Browser-Local Mode (`BROWSER LOCAL`)** — Runs 100% locally in Chrome/Edge with no Python install required:
+   - **Private SSD Storage:** Your imported songs, stems, beat grids, and projects are stored locally inside your browser's **IndexedDB** (`retex_core_browser_local_v1`) — nothing is uploaded anywhere.
+   - **In-Browser AI 4-Stem Separation (WebGPU GPU + WASM CPU fallback):** Clicking **`+ Import`** separates MP3/WAV/FLAC songs into `drums / bass / other / vocals` locally via **HTDemucs ONNX** (`demucs-web` + `onnxruntime-web`), automatically using your GPU via **WebGPU** when available (with automatic WASM CPU fallback; ~172 MB model downloaded once and cached in IndexedDB).
+   - **Instant Direct & Pre-Separated Stem Import:** Inside the **`BROWSER LOCAL`** settings modal, switch to **Instant Direct Import** or click **Import Pre-Separated Stems...** to load existing `*drums* / *bass* / *other* / *vocals*` files in seconds.
+   - **Full Interactive DAW + Demo Pack:** Includes 2 pre-baked royalty-free 4-stem demo tracks, client-side zero-phase beat/key detection & drift quantization, `AudioWorklet` pitch shifting, **Split (`S`)**, **Duplicate After (`Ctrl+D`)**, and in-browser **WAV Export**.
 
 ---
 

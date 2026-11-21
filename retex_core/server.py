@@ -11,15 +11,33 @@ import time
 from pathlib import Path
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import audio_io, grid as G, library, mixer, project as P, quantize as Q, warp
-from .config import CORE_DATA, EXPORTS, SR, STEMS, WEB
+from .config import CORE_DATA, EXPORTS, MODE, SR, STEMS, WEB
 from .jobs import bus, jobs
 from .player import player
 
 app = FastAPI(title="Re-Tex Core")
+
+# Enable GitHub Pages (HTTPS) & local browser proxy window connections to 127.0.0.1:8770
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "https://texmexdex.github.io",
+        "http://127.0.0.1:8770",
+        "http://localhost:8770",
+        "http://127.0.0.1:8774",
+        "http://localhost:8774",
+    ],
+    allow_origin_regex=r"^https?://(127\.0\.0\.1|localhost)(:\d+)?$|^https://[a-zA-Z0-9-]+\.github\.io$",
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+    expose_headers=["X-Stem-Scale", "X-Warp-T0"],
+)
 
 
 def _ui_tag():
@@ -44,14 +62,34 @@ _settle_timer = {"t": None}
 
 
 @app.middleware("http")
-async def _no_cache_ui(request, call_next):
+async def _headers_middleware(request, call_next):
+    # Support Chromium Private Network Access preflights (HTTPS GitHub Pages -> http://127.0.0.1)
+    if request.method == "OPTIONS" and request.headers.get("access-control-request-private-network"):
+        origin = request.headers.get("origin") or "*"
+        return Response(
+            status_code=204,
+            headers={
+                "Access-Control-Allow-Origin": origin,
+                "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+                "Access-Control-Allow-Headers": request.headers.get("access-control-request-headers", "*"),
+                "Access-Control-Allow-Private-Network": "true",
+                "Access-Control-Max-Age": "600",
+            },
+        )
     resp = await call_next(request)
+    if request.headers.get("origin"):
+        resp.headers.setdefault("Access-Control-Allow-Private-Network", "true")
     if request.url.path.startswith(("/static/", "/ui/")):
         resp.headers["Cache-Control"] = "no-cache"
     return resp
 
 
-# ------------------------------------------------------------------ UI & Events
+# ------------------------------------------------------------------ UI, Health & Events
+
+@app.get("/api/health")
+def api_health():
+    return {"ok": True, "app": "retex-core", "mode": MODE, "version": "1.0.0"}
+
 
 @app.get("/")
 def index():

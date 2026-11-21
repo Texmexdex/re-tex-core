@@ -757,7 +757,7 @@ function handleEvent(msg) {
           resEl.classList.remove("hidden");
           const lufs = res.lufs !== undefined ? ` · ${Number(res.lufs).toFixed(1)} LUFS` : "";
           const peak = res.peak_db !== undefined ? ` · peak ${Number(res.peak_db).toFixed(1)} dBFS` : "";
-          const href = res.blob_url || `/api/exports/${encodeURIComponent(res.file)}`;
+          const href = res.blob_url || `${window.__retexApiBase || ""}/api/exports/${encodeURIComponent(res.file)}`;
           resEl.innerHTML = `Saved: <a href="${href}" style="color:#2ee06e" download="${res.file}">${res.file}</a>${lufs}${peak}`;
         }
         api.toast(`Export complete: ${res.file}`, "ok");
@@ -811,8 +811,12 @@ function handleEvent(msg) {
     refreshGridModal(false);
     requestDraw();
   } else if (msg.type === "library_updated") {
-    api.get("/api/songs").then((list) => {
+    Promise.all([
+      api.get("/api/songs"),
+      api.get("/api/folders").catch(() => S.folders),
+    ]).then(([list, folders]) => {
       S.songs = list;
+      if (folders) S.folders = folders;
       emit("songs");
     }).catch(() => {});
   }
