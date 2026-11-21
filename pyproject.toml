@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "retex-core"
+version = "1.0.0"
+description = "Lean, transient-verified multi-stem mashup DAW with browser Web Audio playback and Viterbi beat quantization."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.115",
+  "uvicorn>=0.30",
+  "python-multipart>=0.0.9",
+  "numpy>=1.26",
+  "scipy>=1.13",
+  "numba>=0.60",
+  "pedalboard>=0.9",
+  "soundfile>=0.12",
+  "soxr>=0.4",
+  "pyloudnorm>=0.1.1",
+  "sounddevice>=0.5",
+]
+
+[project.optional-dependencies]
+# Standalone portable stem separation (Mel-Band Roformer + HTDemucs/SCNet) & neural beat tracking
+standalone = [
+  "audio-separator>=0.28",
+  "beat-this>=0.1",
+]
+
+[project.scripts]
+retex-core = "retex_core.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["retex_core*"]

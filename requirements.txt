@@ -1,0 +1,16 @@
+# Re-Tex Core lightweight dependencies (Python 3.13)
+# Core DAW (beat grid, Viterbi audit, R3 quantize/warp, browser playback, -12 LUFS export):
+fastapi
+uvicorn
+python-multipart
+numpy
+scipy
+numba
+pedalboard
+soundfile
+soxr
+pyloudnorm
+sounddevice
+
+# Note: + Import (separating brand-new audio files into 4 stems) reuses F:\mashup_lab\.venv-phase2
+# (PyTorch CUDA + BS-Roformer / Beat This!) via mashlab.library.import_file without duplicating models.

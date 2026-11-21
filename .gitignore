@@ -1,0 +1,25 @@
+# Local runtime data, audio libraries, caches, projects, and AI model weights
+data/
+models/
+.venv/
+venv/
+env/
+
+# Python caches & build artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+
+# Raw audio & OS files
+*.wav
+*.flac
+*.mp3
+*.m4a
+*.ogg
+*.npy
+.DS_Store
+Thumbs.db
+*.tmp

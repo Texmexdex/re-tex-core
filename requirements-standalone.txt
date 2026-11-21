@@ -1,0 +1,6 @@
+# Optional standalone AI stem separation & neural beat tracking dependencies
+# Install AFTER requirements.txt (and CUDA PyTorch if you have an NVIDIA GPU):
+#   pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu128
+#   pip install -r requirements-standalone.txt
+audio-separator>=0.28
+beat-this>=0.1
