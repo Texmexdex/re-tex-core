@@ -349,10 +349,34 @@
       return jsonResp(job);
     }
 
+    function syncSongSummaryGrid(sid, g) {
+      const s = st.songs.find((x) => x.id === sid);
+      if (s && g) {
+        s.bpm = +Number(g.bpm || s.bpm).toFixed(2);
+        s.bpb = Number(g.bpb || s.bpb || 4);
+        s.core_grid = {
+          bpm: g.bpm,
+          bpb: g.bpb,
+          audit: g.audit,
+          quantized: Boolean(g.quantized && g.quantized.sig === g.sig),
+          sig: g.sig,
+        };
+      }
+    }
+
     // ---- Grid audit & manual adjustments
     const mAudit = path.match(/^\/api\/songs\/([^/]+)\/grid\/audit$/);
     if (mAudit && method === "POST") {
       const sid = decodeURIComponent(mAudit[1]);
+      if (st.localIds.has(sid) && window.RetexBrowserDSP) {
+        const det = st.details[sid];
+        if (!det) return jsonResp({ detail: "Not found" }, 404);
+        const g = await window.RetexBrowserDSP.autoFixLocalGrid(det);
+        st.details[sid].grid = g;
+        syncSongSummaryGrid(sid, g);
+        emitSSE("grid_updated", { sid, grid: g });
+        return jsonResp(g);
+      }
       const orig = st.rawBundle.details[sid]?.grid || st.details[sid]?.grid;
       if (!orig) return jsonResp({ detail: "Not found" }, 404);
       st.details[sid].grid = clone(orig);
@@ -365,6 +389,13 @@
       const sid = decodeURIComponent(mGridPut[1]);
       const det = st.details[sid];
       if (!det?.grid) return jsonResp({ detail: "Not found" }, 404);
+      if (st.localIds.has(sid) && window.RetexBrowserDSP) {
+        const g = await window.RetexBrowserDSP.updateLocalGrid(det, body || {});
+        st.details[sid].grid = g;
+        syncSongSummaryGrid(sid, g);
+        emitSSE("grid_updated", { sid, grid: g });
+        return jsonResp(g);
+      }
       const g = det.grid;
       const b = body || {};
       const bpb = Number(b.bpb || g.bpb || 4);
@@ -426,6 +457,8 @@
               job.message = m;
               emitSSE("job", { job: clone(job) });
             });
+            st.details[sid].grid = g;
+            syncSongSummaryGrid(sid, g);
             job.status = "done";
             job.progress = 1.0;
             emitSSE("job", { job: clone(job) });

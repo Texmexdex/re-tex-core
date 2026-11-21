@@ -806,6 +806,9 @@ function handleEvent(msg) {
         });
       }
     }
+    if (S.project?.songs?.[msg.sid]) {
+      audio.syncProjectPlan(S.project);
+    }
     emit("song_detail");
     renderSongsStrip();
     refreshGridModal(false);

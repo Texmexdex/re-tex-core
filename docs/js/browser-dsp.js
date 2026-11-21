@@ -2,11 +2,20 @@
 // Runs 100% locally on the user's computer — zero audio ever leaves the device!
 
 (function () {
+  const ROOT = typeof window !== "undefined" ? window : globalThis;
   const DB_NAME = "retex_core_browser_local_v1";
   const DB_VER = 1;
   const SR = 44100;
+  const ENV_FPS = 500;
+  const ACTIVE_SHARE = 0.22;
+  const OFFBEAT_WARN_MS = 22.0;
+  const DRIFT_WARN_MS = 16.0;
   const STEMS = ["drums", "bass", "other", "vocals"];
   const MODEL_KEY = "htdemucs_embedded_v1";
+
+  const N_DELTAS = 201; // 0.005 beat step (~2-3 ms resolution), matching grid.py
+  const DELTAS = new Float64Array(N_DELTAS);
+  for (let i = 0; i < N_DELTAS; i++) DELTAS[i] = -0.5 + i / (N_DELTAS - 1);
 
   let dbPromise = null;
   let demucsState = { processor: null, provider: null };
@@ -178,20 +187,91 @@
     return out;
   }
 
-  // ------------------------------------------------------------------ Zero-Phase Onset, Beat Audit & Key Detection
+  // ------------------------------------------------------------------ Numeric Helpers
 
-  function biquadBandpassZeroPhase(x, sr, fCenter, Q) {
-    const w0 = (2 * Math.PI * fCenter) / sr;
-    const alpha = Math.sin(w0) / (2 * Q);
+  function medianOf(arr) {
+    if (!arr.length) return 0;
+    const s = Array.from(arr).sort((a, b) => a - b);
+    const m = s.length >> 1;
+    return s.length % 2 ? s[m] : 0.5 * (s[m - 1] + s[m]);
+  }
+
+  function percentileOf(arr, pct) {
+    if (!arr.length) return 0;
+    const s = Array.from(arr).sort((a, b) => a - b);
+    const pos = Math.max(0, Math.min(s.length - 1, (pct / 100) * (s.length - 1)));
+    const i0 = Math.floor(pos);
+    const i1 = Math.min(s.length - 1, i0 + 1);
+    return s[i0] + (pos - i0) * (s[i1] - s[i0]);
+  }
+
+  function medianDiff(arr) {
+    if (arr.length < 2) return 0.5;
+    const d = new Float64Array(arr.length - 1);
+    for (let i = 1; i < arr.length; i++) d[i - 1] = arr[i] - arr[i - 1];
+    d.sort();
+    const m = d.length >> 1;
+    return d.length % 2 ? d[m] : 0.5 * (d[m - 1] + d[m]);
+  }
+
+  function linearFit(xs, ys) {
+    const n = xs.length;
+    if (n < 2) return { slope: 0.5, intercept: ys[0] || 0 };
+    let sx = 0, sy = 0, sxx = 0, sxy = 0;
+    for (let i = 0; i < n; i++) {
+      const x = xs[i], y = ys[i];
+      sx += x; sy += y; sxx += x * x; sxy += x * y;
+    }
+    const den = n * sxx - sx * sx;
+    if (Math.abs(den) < 1e-12) return { slope: 0.5, intercept: sy / n };
+    const slope = (n * sxy - sx * sy) / den;
+    const intercept = (sy - slope * sx) / n;
+    return { slope, intercept };
+  }
+
+  function gridSigJS(grid) {
+    const b = grid.beats || [];
+    let h = 2166136261 >>> 0;
+    const mix = (str) => {
+      for (let i = 0; i < str.length; i++) {
+        h ^= str.charCodeAt(i);
+        h = Math.imul(h, 16777619) >>> 0;
+      }
+    };
+    mix(`${b.length}:${grid.bpb || 4}:${grid.downbeat_offset || 0}:`);
+    for (let i = 0; i < b.length; i++) mix(`${Math.round(b[i] * 1000)},`);
+    return `b${b.length}_${h.toString(16).padStart(8, "0")}`;
+  }
+
+  // ------------------------------------------------------------------ Zero-Phase 500 Hz Full-Band Onsets (Exact port of grid.py)
+
+  function biquadCoeffs(type, fc, sr, Q = Math.SQRT1_2) {
+    const w0 = (2 * Math.PI * fc) / sr;
     const cosw = Math.cos(w0);
+    const alpha = Math.sin(w0) / (2 * Q);
     const a0 = 1 + alpha;
-    const b0 = alpha / a0;
-    const b1 = 0;
-    const b2 = -alpha / a0;
-    const a1 = (-2 * cosw) / a0;
-    const a2 = (1 - alpha) / a0;
+    if (type === "hpf") {
+      return {
+        b0: ((1 + cosw) * 0.5) / a0,
+        b1: -(1 + cosw) / a0,
+        b2: ((1 + cosw) * 0.5) / a0,
+        a1: (-2 * cosw) / a0,
+        a2: (1 - alpha) / a0,
+      };
+    }
+    return {
+      b0: ((1 - cosw) * 0.5) / a0,
+      b1: (1 - cosw) / a0,
+      b2: ((1 - cosw) * 0.5) / a0,
+      a1: (-2 * cosw) / a0,
+      a2: (1 - alpha) / a0,
+    };
+  }
+
+  function filtfiltBiquad(x, c) {
     const n = x.length;
     const tmp = new Float32Array(n);
+    const { b0, b1, b2, a1, a2 } = c;
     let x1 = 0, x2 = 0, y1 = 0, y2 = 0;
     for (let i = 0; i < n; i++) {
       const xi = x[i];
@@ -210,14 +290,37 @@
     return out;
   }
 
-  function onsetCurve200Hz(mono, sr = SR) {
-    const fps = 200;
-    const hop = Math.round(sr / fps);
-    const nFr = Math.floor(mono.length / hop);
-    if (nFr < 16) return { body: new Float32Array(16), kick: new Float32Array(16), fps };
+  function bandpassZeroPhase(x, sr, fLo, fHi) {
+    // Cascaded 2nd-order Butterworth HPF then LPF, forward+reverse -> 0.0 ms group delay & rock-solid stability
+    const hp = filtfiltBiquad(x, biquadCoeffs("hpf", fLo, sr, Math.SQRT1_2));
+    return filtfiltBiquad(hp, biquadCoeffs("lpf", fHi, sr, Math.SQRT1_2));
+  }
 
-    const kSig = biquadBandpassZeroPhase(mono, sr, 90, 0.9);
-    const sSig = biquadBandpassZeroPhase(mono, sr, 1200, 0.7);
+  function smoothBody6ms(body) {
+    const n = body.length;
+    const sm = new Float32Array(n);
+    for (let i = 0; i < n; i++) {
+      const a = body[i > 1 ? i - 2 : 0];
+      const b = body[i > 0 ? i - 1 : 0];
+      const c = body[i];
+      const d = body[i + 1 < n ? i + 1 : n - 1];
+      const e = body[i + 2 < n ? i + 2 : n - 1];
+      sm[i] = 0.1 * a + 0.2 * b + 0.4 * c + 0.2 * d + 0.1 * e;
+    }
+    return sm;
+  }
+
+  function onsetCurves500Hz(mono, sr = SR) {
+    const hop = Math.max(1, Math.round(sr / ENV_FPS));
+    const fps = sr / hop;
+    const nFr = Math.floor(mono.length / hop);
+    if (nFr < 16) {
+      const z = new Float32Array(Math.max(16, nFr));
+      return { body: z, bodySmooth: z, kick: z, snare: z, fps };
+    }
+
+    const kSig = bandpassZeroPhase(mono, sr, 30, 160);
+    const sSig = bandpassZeroPhase(mono, sr, 250, 3500);
     const kOn = new Float32Array(nFr);
     const sOn = new Float32Array(nFr);
     let pkPrev = 0, psPrev = 0;
@@ -239,105 +342,229 @@
     }
     const norm = (arr) => {
       const sorted = Float32Array.from(arr).sort();
-      const p99 = sorted[Math.floor(sorted.length * 0.995)] || 1;
-      for (let i = 0; i < arr.length; i++) arr[i] /= p99;
+      const p995 = sorted[Math.floor(sorted.length * 0.995)] || 1;
+      const inv = 1 / p995;
+      for (let i = 0; i < arr.length; i++) arr[i] *= inv;
     };
     norm(kOn);
     norm(sOn);
     const body = new Float32Array(nFr);
     for (let i = 0; i < nFr; i++) body[i] = kOn[i] + 0.85 * sOn[i];
-    return { body, kick: kOn, fps };
+    const bodySmooth = smoothBody6ms(body);
+    return { body, bodySmooth, kick: kOn, snare: sOn, fps };
   }
 
-  function windowPhaseOffset(times, body, fps) {
-    const n = body.length;
-    if (times.length < 4) return { offS: 0, cl: 1, ratio: 1 };
-    const diffs = [];
-    for (let i = 1; i < times.length; i++) diffs.push(times[i] - times[i - 1]);
-    diffs.sort((a, b) => a - b);
-    const per = diffs[diffs.length >> 1] || 0.5;
-    const M = 101; // 0.01 beat step (~4 ms)
-    const scores = new Float64Array(M);
-    for (let d = 0; d < M; d++) {
-      const delta = -0.5 + d / (M - 1);
+  // ------------------------------------------------------------------ k=1 Beat-Hit Audit & Viterbi Phase Tracker (Exact port of grid.py)
+
+  function windowPhaseProfile(times, bodySmooth, fps) {
+    const n = bodySmooth.length;
+    const clarityCurve = new Float64Array(N_DELTAS);
+    const scores = new Float64Array(N_DELTAS);
+    if (times.length < 4) {
+      clarityCurve.fill(1);
+      return { clarityCurve, scores, per: 0.5, medScore: 1 };
+    }
+    const per = medianDiff(times);
+    if (per <= 0.1 || per >= 2.5) {
+      clarityCurve.fill(1);
+      return { clarityCurve, scores, per: 0.5, medScore: 1 };
+    }
+    for (let d = 0; d < N_DELTAS; d++) {
+      const shift = DELTAS[d] * per;
       let s = 0, c = 0;
       for (let k = 0; k < times.length; k++) {
-        const fr = Math.round((times[k] + delta * per) * fps);
-        if (fr >= 1 && fr < n - 1) {
-          s += 0.25 * body[fr - 1] + 0.5 * body[fr] + 0.25 * body[fr + 1];
+        const fr = Math.round((times[k] + shift) * fps);
+        if (fr >= 0 && fr < n) {
+          s += bodySmooth[fr];
           c++;
         }
       }
       scores[d] = c ? s / c : 0;
     }
     const sorted = Float64Array.from(scores).sort();
-    const med = sorted[M >> 1] + 1e-9;
-    const z0 = scores[50];
-    let bestG = 0, bestL = 40;
-    for (let d = 0; d < M; d++) {
-      if (scores[d] > scores[bestG]) bestG = d;
-      if (d >= 40 && d <= 60 && scores[d] > scores[bestL]) bestL = d;
+    const medScore = sorted[N_DELTAS >> 1] + 1e-9;
+    const invMed = 1 / medScore;
+    for (let d = 0; d < N_DELTAS; d++) clarityCurve[d] = scores[d] * invMed;
+    return { clarityCurve, scores, per, medScore };
+  }
+
+  function windowPhaseOffset(times, bodySmooth, fps) {
+    const { clarityCurve, scores, per } = windowPhaseProfile(times, bodySmooth, fps);
+    const z0 = scores[100]; // delta = 0.0
+    let globI = 0;
+    let locI = 80; // delta = -0.10 .. +0.10 -> indices 80..120
+    for (let d = 0; d < N_DELTAS; d++) {
+      if (scores[d] > scores[globI]) globI = d;
+      if (d >= 80 && d <= 120 && scores[d] > scores[locI]) locI = d;
     }
-    const locCl = scores[bestL] / med;
-    const globCl = scores[bestG] / med;
-    const useLocal = (locCl >= 1.35 && scores[bestG] / Math.max(scores[bestL], 1e-9) < 2.1)
-      || (scores[bestG] / Math.max(z0, 1e-9) < 1.35);
-    const pick = useLocal ? bestL : bestG;
+    const globScore = scores[globI];
+    const locScore = scores[locI];
+    const locCl = clarityCurve[locI];
+    const useLocal = (locCl >= 1.35 && globScore / Math.max(locScore, 1e-9) < 2.1)
+      || (globScore / Math.max(z0, 1e-9) < 1.35);
+    const pick = useLocal ? locI : globI;
     return {
-      offS: (-0.5 + pick / (M - 1)) * per,
-      cl: scores[pick] / med,
+      offS: DELTAS[pick] * per,
+      peak: scores[pick],
+      z0,
+      cl: clarityCurve[pick],
       ratio: scores[pick] / Math.max(z0, 1e-9),
     };
   }
 
-  function auditBeatsJS(beats, body, fps) {
+  function viterbiPhaseTrack(curves, winCenters, pMed) {
+    const W = curves.length;
+    if (W === 0) return new Float64Array(0);
+    const prior = new Float64Array(N_DELTAS);
+    for (let d = 0; d < N_DELTAS; d++) {
+      const r = DELTAS[d] / 0.065;
+      prior[d] = 0.22 * Math.exp(-r * r);
+    }
+    if (W === 1) {
+      let best = 0, bestV = -1e9;
+      for (let d = 0; d < N_DELTAS; d++) {
+        const v = Math.min(curves[0][d], 10.0) + prior[d];
+        if (v > bestV) { bestV = v; best = d; }
+      }
+      return Float64Array.from([DELTAS[best] * pMed]);
+    }
+
+    // Circular shortest signed distance matrix between delta states
+    const diffSq = new Float64Array(N_DELTAS * N_DELTAS);
+    for (let i = 0; i < N_DELTAS; i++) {
+      const di = DELTAS[i];
+      const row = i * N_DELTAS;
+      for (let j = 0; j < N_DELTAS; j++) {
+        let df = (DELTAS[j] - di + 0.5) % 1.0;
+        if (df < 0) df += 1.0;
+        df -= 0.5;
+        diffSq[row + j] = df * df;
+      }
+    }
+
+    const dp = new Float64Array(W * N_DELTAS);
+    const back = new Int32Array(W * N_DELTAS);
+    for (let d = 0; d < N_DELTAS; d++) {
+      dp[d] = Math.min(curves[0][d], 10.0) + prior[d];
+    }
+
+    for (let w = 1; w < W; w++) {
+      const gapBeats = Math.max(4.0, winCenters[w] - winCenters[w - 1]);
+      const lam = 220.0 / Math.pow(gapBeats / 4.0, 0.75);
+      const prevOff = (w - 1) * N_DELTAS;
+      const curOff = w * N_DELTAS;
+      const cCurve = curves[w];
+      for (let j = 0; j < N_DELTAS; j++) {
+        let bestI = 0;
+        let bestVal = -1e18;
+        for (let i = 0; i < N_DELTAS; i++) {
+          const val = dp[prevOff + i] - lam * diffSq[i * N_DELTAS + j];
+          if (val > bestVal) { bestVal = val; bestI = i; }
+        }
+        back[curOff + j] = bestI;
+        dp[curOff + j] = Math.min(cCurve[j], 10.0) + prior[j] + bestVal;
+      }
+    }
+
+    const path = new Int32Array(W);
+    let lastBest = 0;
+    const lastOff = (W - 1) * N_DELTAS;
+    for (let d = 1; d < N_DELTAS; d++) {
+      if (dp[lastOff + d] > dp[lastOff + lastBest]) lastBest = d;
+    }
+    path[W - 1] = lastBest;
+    for (let w = W - 2; w >= 0; w--) {
+      path[w] = back[(w + 1) * N_DELTAS + path[w + 1]];
+    }
+
+    // Unwrap along exact circular step deltas (never suffers abrupt +-0.5 wrap flips!)
+    const deltasUnwrapped = new Float64Array(W);
+    deltasUnwrapped[0] = DELTAS[path[0]];
+    for (let w = 1; w < W; w++) {
+      let stepD = (DELTAS[path[w]] - DELTAS[path[w - 1]] + 0.5) % 1.0;
+      if (stepD < 0) stepD += 1.0;
+      stepD -= 0.5;
+      deltasUnwrapped[w] = deltasUnwrapped[w - 1] + stepD;
+    }
+    const medD = medianOf(deltasUnwrapped);
+    const shiftInt = Math.round(medD);
+    for (let w = 0; w < W; w++) deltasUnwrapped[w] = (deltasUnwrapped[w] - shiftInt) * pMed;
+    return deltasUnwrapped;
+  }
+
+  function auditBeatsJS(beats, body, bodySmooth, fps, winBeats = 16, stepBeats = 8) {
     const n = beats.length;
-    const win = 16, step = 8;
-    const sections = [];
+    if (n < 8) {
+      return {
+        status: "warn", median_offset_ms: 0, max_offset_ms: 0, signed_median_ms: 0,
+        active_windows: 0, bad_windows: 0, drift_pct: 0, max_straight_err_ms: 0,
+        needs_quantize: false, sections: [],
+      };
+    }
+
+    const winStarts = [];
     const energies = [];
-    for (let i = 0; i <= Math.max(0, n - win); i += step) {
-      const seg = beats.slice(i, Math.min(n, i + win));
+    const lastI = Math.max(0, n - winBeats);
+    for (let i = 0; i <= lastI; i += stepBeats) {
+      const seg = beats.slice(i, Math.min(n, i + winBeats));
       const f0 = Math.max(0, Math.floor(seg[0] * fps));
       const f1 = Math.min(body.length, Math.floor(seg[seg.length - 1] * fps));
       let s = 0;
       for (let f = f0; f < f1; f++) s += body[f];
+      winStarts.push(i);
       energies.push(f1 > f0 ? s / (f1 - f0) : 0);
     }
-    const maxE = Math.max(0, ...energies);
-    const nz = energies.filter((e) => e > 0.25 * maxE).sort((a, b) => a - b);
-    const usual = nz.length ? nz[nz.length >> 1] : 0;
+    let maxE = 0;
+    for (const e of energies) if (e > maxE) maxE = e;
+    const nz = energies.filter((e) => e > 0.25 * maxE);
+    const usual = nz.length ? medianOf(nz) : 0;
 
+    const sections = [];
     const offs = [];
-    let idxW = 0;
-    for (let i = 0; i <= Math.max(0, n - win); i += step, idxW++) {
-      const seg = beats.slice(i, Math.min(n, i + win));
+    for (let idxW = 0; idxW < winStarts.length; idxW++) {
+      const i = winStarts[idxW];
+      const seg = beats.slice(i, Math.min(n, i + winBeats));
       if (seg.length < 8) continue;
-      const active = energies[idxW] >= 0.22 * usual && usual > 1e-4;
-      const diffs = [];
-      for (let k = 1; k < seg.length; k++) diffs.push(seg[k] - seg[k - 1]);
-      diffs.sort((a, b) => a - b);
-      const bpm = diffs.length ? 60 / diffs[diffs.length >> 1] : 120;
+      const active = energies[idxW] >= ACTIVE_SHARE * usual && usual > 1e-4;
+      const per = medianDiff(seg);
+      const bpm = per > 0 ? 60 / per : 120;
       if (!active) {
-        sections.push({ i0: i, i1: i + seg.length, t0: +seg[0].toFixed(2), t1: +seg[seg.length - 1].toFixed(2), bpm: +bpm.toFixed(2), active: false, offset_ms: 0, clarity: 0, ratio: 1 });
+        sections.push({
+          i0: i, i1: i + seg.length, t0: +seg[0].toFixed(2), t1: +seg[seg.length - 1].toFixed(2),
+          bpm: +bpm.toFixed(2), active: false, offset_ms: 0, clarity: 0, ratio: 1,
+        });
         continue;
       }
-      const { offS, cl, ratio } = windowPhaseOffset(seg, body, fps);
+      const { offS, cl, ratio } = windowPhaseOffset(seg, bodySmooth, fps);
       const offMs = offS * 1000;
       offs.push(offMs);
-      sections.push({ i0: i, i1: i + seg.length, t0: +seg[0].toFixed(2), t1: +seg[seg.length - 1].toFixed(2), bpm: +bpm.toFixed(2), active: true, offset_ms: +offMs.toFixed(1), clarity: +cl.toFixed(2), ratio: +ratio.toFixed(2) });
+      sections.push({
+        i0: i, i1: i + seg.length, t0: +seg[0].toFixed(2), t1: +seg[seg.length - 1].toFixed(2),
+        bpm: +bpm.toFixed(2), active: true, offset_ms: +offMs.toFixed(1),
+        clarity: +cl.toFixed(2), ratio: +ratio.toFixed(2),
+      });
     }
 
-    const absOffs = offs.map(Math.abs).sort((a, b) => a - b);
-    const medAbs = absOffs.length ? absOffs[absOffs.length >> 1] : 0;
-    const maxAbs = absOffs.length ? absOffs[absOffs.length - 1] : 0;
-    const signedSorted = [...offs].sort((a, b) => a - b);
-    const signedMed = signedSorted.length ? signedSorted[signedSorted.length >> 1] : 0;
-    const badWins = sections.filter((s) => s.active && Math.abs(s.offset_ms) > 22 && s.clarity >= 1.8).length;
-    const activeBpms = sections.filter((s) => s.active && s.bpm > 0).map((s) => s.bpm).sort((a, b) => a - b);
-    const driftPct = activeBpms.length >= 2 ? ((activeBpms[activeBpms.length - 1] - activeBpms[0]) / activeBpms[activeBpms.length >> 1]) * 100 : 0;
+    // Straight-line deviation across beats (exact match to grid.py)
+    const jIdx = Array.from({ length: n }, (_, k) => k);
+    const { slope, intercept } = linearFit(jIdx, beats);
+    const straightErrMs = beats.map((bt, k) => Math.abs(bt - (intercept + slope * k)) * 1000);
+    const maxStraightErrMs = percentileOf(straightErrMs, 95);
+
+    const activeBpms = sections.filter((s) => s.active && s.bpm > 0).map((s) => s.bpm);
+    const driftPct = activeBpms.length >= 2
+      ? ((Math.max(...activeBpms) - Math.min(...activeBpms)) / Math.max(1e-6, medianOf(activeBpms))) * 100
+      : 0;
+
+    const absOffs = offs.map(Math.abs);
+    const medAbs = absOffs.length ? medianOf(absOffs) : 0;
+    const maxAbs = absOffs.length ? Math.max(...absOffs) : 0;
+    const signedMed = offs.length ? medianOf(offs) : 0;
+    const badWins = sections.filter((s) => s.active && Math.abs(s.offset_ms) > OFFBEAT_WARN_MS && s.clarity >= 1.8).length;
+    const badThresh = Math.max(2, Math.round(0.1 * Math.max(1, offs.length)));
 
     let status = "ok";
-    if (medAbs > 22 || badWins >= Math.max(2, Math.round(0.1 * Math.max(1, offs.length)))) status = "off_beat";
+    if (medAbs > OFFBEAT_WARN_MS || badWins >= badThresh) status = "off_beat";
     else if (badWins > 0 || maxAbs > 18) status = "warn";
 
     return {
@@ -348,102 +575,640 @@
       active_windows: offs.length,
       bad_windows: badWins,
       drift_pct: +driftPct.toFixed(2),
-      max_straight_err_ms: +(driftPct * 12).toFixed(1),
-      needs_quantize: driftPct > 0.45,
+      max_straight_err_ms: +maxStraightErrMs.toFixed(1),
+      needs_quantize: maxStraightErrMs > DRIFT_WARN_MS || driftPct > 0.35,
       sections,
     };
   }
 
-  function detectAndBuildGrid(left, right, sid, title) {
+  // ------------------------------------------------------------------ Multi-Window Tempo + Local-Tempo Ellis DP Beat Tracker
+
+  function phaseHistSharpness(bodySmooth, fps, fStart, fEnd, periodS, nBins = 64) {
+    const hist = new Float64Array(nBins);
+    const cnt = new Int32Array(nBins);
+    const invP = 1.0 / periodS;
+    const invFps = 1.0 / fps;
+    for (let f = fStart; f < fEnd; f++) {
+      const ph = (f * invFps) * invP;
+      const frac = ph - Math.floor(ph);
+      const b = Math.min(nBins - 1, Math.floor(frac * nBins));
+      hist[b] += bodySmooth[f];
+      cnt[b]++;
+    }
+    let bestBin = 0;
+    let bestVal = 0;
+    for (let b = 0; b < nBins; b++) {
+      if (cnt[b] > 0) hist[b] /= cnt[b];
+      if (hist[b] > bestVal) { bestVal = hist[b]; bestBin = b; }
+    }
+    const sorted = Float64Array.from(hist).sort();
+    const med = sorted[nBins >> 1] + 1e-9;
+    return { clarity: bestVal / med, peak: bestVal, bestBin, hist };
+  }
+
+  function estimateGlobalPeriod(body, bodySmooth, fps, preferBpm = null) {
+    // Max-pool 500 Hz body -> ~100 Hz for fast full-song autocorrelation
+    const dec = 5;
+    const fps100 = fps / dec;
+    const n100 = Math.floor(body.length / dec);
+    const env100 = new Float32Array(n100);
+    let mean = 0;
+    for (let i = 0; i < n100; i++) {
+      let mx = 0;
+      const base = i * dec;
+      for (let k = 0; k < dec; k++) {
+        const v = body[base + k];
+        if (v > mx) mx = v;
+      }
+      env100[i] = mx;
+      mean += mx;
+    }
+    mean /= n100 || 1;
+    const centered = new Float32Array(n100);
+    for (let i = 0; i < n100; i++) centered[i] = env100[i] - mean;
+
+    const minBpm = preferBpm ? Math.max(45, preferBpm * 0.86) : 60;
+    const maxBpm = preferBpm ? Math.min(220, preferBpm * 1.16) : 196;
+    const loLag = Math.max(20, Math.floor((fps100 * 60) / maxBpm));
+    const hiLag = Math.min(n100 - 2, Math.ceil((fps100 * 60) / minBpm));
+    const maxAcfLag = Math.min(n100 - 1, hiLag * 3 + 2);
+    const acf = new Float64Array(maxAcfLag + 1);
+    const stepI = n100 > 30000 ? 2 : 1;
+    for (let lag = Math.max(10, Math.floor(loLag / 2)); lag <= maxAcfLag; lag++) {
+      let s = 0;
+      const lim = n100 - lag;
+      for (let i = 0; i < lim; i += stepI) s += centered[i] * centered[i + lag];
+      acf[lag] = lim > 0 ? s / (lim / stepI) : 0;
+    }
+
+    // Harmonic comb scoring across loLag..hiLag
+    const comb = new Float64Array(hiLag + 1);
+    for (let lag = loLag; lag <= hiLag; lag++) {
+      const bpm = (fps100 * 60) / lag;
+      const l2 = lag * 2;
+      const l3 = lag * 3;
+      const lh = Math.round(lag * 0.5);
+      let sc = acf[lag];
+      if (l2 <= maxAcfLag) sc += 0.55 * acf[l2];
+      if (l3 <= maxAcfLag) sc += 0.25 * acf[l3];
+      if (lh >= 10 && lh <= maxAcfLag) sc += 0.28 * acf[lh];
+      const prior = preferBpm
+        ? Math.exp(-0.5 * Math.pow((bpm - preferBpm) / (0.08 * preferBpm), 2))
+        : (0.76 + 0.24 * Math.exp(-0.5 * Math.pow(Math.log2(bpm / 118) / 0.55, 2)));
+      comb[lag] = Math.max(0, sc) * prior;
+    }
+
+    // Collect top distinct local peaks
+    const peaks = [];
+    for (let lag = loLag + 1; lag < hiLag; lag++) {
+      if (comb[lag] >= comb[lag - 1] && comb[lag] >= comb[lag + 1] && comb[lag] > 0) {
+        peaks.push({ lag, score: comb[lag] });
+      }
+    }
+    peaks.sort((a, b) => b.score - a.score);
+    const candPeriods = [];
+    const addCand = (p) => {
+      const bpm = 60 / p;
+      if (bpm < minBpm || bpm > maxBpm) return;
+      if (candPeriods.some((x) => Math.abs(x - p) / p < 0.015)) return;
+      candPeriods.push(p);
+    };
+    if (preferBpm) addCand(60 / preferBpm);
+    for (const pk of peaks.slice(0, 6)) {
+      const p = pk.lag / fps100;
+      addCand(p);
+      if (!preferBpm) {
+        addCand(p * 0.5);
+        addCand(p * 2.0);
+      }
+    }
+    if (!candPeriods.length) candPeriods.push(preferBpm ? 60 / preferBpm : 0.5);
+
+    // Choose up to 6 active 20-second slices across the song so drifting songs don't smear!
+    const sliceLen = Math.min(bodySmooth.length, Math.round(20 * fps));
+    const sliceStep = Math.max(1, Math.floor((bodySmooth.length - sliceLen) / 5));
+    const rawSlices = [];
+    for (let s0 = 0; s0 + sliceLen <= bodySmooth.length; s0 += sliceStep) {
+      let e = 0;
+      for (let f = s0; f < s0 + sliceLen; f++) e += body[f];
+      rawSlices.push({ f0: s0, f1: s0 + sliceLen, e: e / sliceLen });
+      if (rawSlices.length >= 6) break;
+    }
+    if (!rawSlices.length) rawSlices.push({ f0: 0, f1: bodySmooth.length, e: 1 });
+    const maxSE = Math.max(...rawSlices.map((s) => s.e));
+    const slices = rawSlices.filter((s) => s.e >= 0.25 * maxSE);
+    const useSlices = slices.length ? slices : rawSlices;
+
+    // Refine each candidate period to ~0.01 BPM precision via phase-histogram sharpness across active slices
+    const evalPeriod = (p) => {
+      let tot = 0;
+      for (const sl of useSlices) tot += phaseHistSharpness(bodySmooth, fps, sl.f0, sl.f1, p, 64).clarity;
+      return tot / useSlices.length;
+    };
+
+    let bestP = candPeriods[0];
+    let bestScore = -1;
+    const refined = [];
+    for (const p0 of candPeriods) {
+      let pBest = p0;
+      let scBest = -1;
+      for (let k = -20; k <= 20; k++) {
+        const p = p0 * (1 + k * 0.0012);
+        const sc = evalPeriod(p);
+        if (sc > scBest) { scBest = sc; pBest = p; }
+      }
+      // Fine zoom +-0.15% at 0.01% step (~0.012 BPM)
+      const pMid = pBest;
+      for (let k = -15; k <= 15; k++) {
+        const p = pMid * (1 + k * 0.0001);
+        const sc = evalPeriod(p);
+        if (sc > scBest) { scBest = sc; pBest = p; }
+      }
+      const bpm = 60 / pBest;
+      const prior = preferBpm
+        ? 1.0
+        : (0.86 + 0.14 * Math.exp(-0.5 * Math.pow(Math.log2(bpm / 118) / 0.55, 2)));
+      refined.push({ p: pBest, rawScore: scBest, score: scBest * prior });
+      if (scBest * prior > bestScore) { bestScore = scBest * prior; bestP = pBest; }
+    }
+
+    // Octave check (unless user locked preferBpm): prevent half-BPM lock when odd beats also carry real drum hits!
+    if (!preferBpm) {
+      const checkSubHit = (periodCheck) => {
+        let ratioSum = 0;
+        for (const sl of useSlices) {
+          const { hist, bestBin, peak } = phaseHistSharpness(bodySmooth, fps, sl.f0, sl.f1, periodCheck, 64);
+          const opp = (bestBin + 32) & 63;
+          let oppPeak = 0;
+          for (let d = -2; d <= 2; d++) {
+            const v = hist[(opp + d + 64) & 63];
+            if (v > oppPeak) oppPeak = v;
+          }
+          ratioSum += oppPeak / Math.max(peak, 1e-9);
+        }
+        return ratioSum / useSlices.length;
+      };
+      const curBpm = 60 / bestP;
+      if (curBpm < 76 && curBpm * 2 <= 185) {
+        if (checkSubHit(bestP) >= 0.28) bestP *= 0.5;
+      } else if (curBpm < 96 && curBpm * 2 <= 185) {
+        if (checkSubHit(bestP) >= 0.42) bestP *= 0.5;
+      }
+      // If BPM > 158 and odd beats on 2*bestP are mostly empty (< 30% of even beats), halve it!
+      if (60 / bestP > 158 && 60 / (bestP * 2.0) >= 68) {
+        if (checkSubHit(bestP * 2.0) < 0.30) bestP *= 2.0;
+      }
+    }
+
+    return { period: bestP, env100, fps100 };
+  }
+
+  function buildLocalPeriodCurve(body, bodySmooth, fps, p0, n100, fps100) {
+    // Measure local tempo in overlapping 10s windows (step 4s) within +-12% of p0
+    const winFr = Math.min(body.length, Math.round(10 * fps));
+    const stepFr = Math.max(1, Math.round(4 * fps));
+    const rawWins = [];
+    for (let f0 = 0; f0 + Math.min(winFr, Math.round(4 * fps)) <= body.length; f0 += stepFr) {
+      const f1 = Math.min(body.length, f0 + winFr);
+      let e = 0;
+      for (let f = f0; f < f1; f++) e += body[f];
+      rawWins.push({ f0, f1, tMid: 0.5 * (f0 + f1) / fps, e: e / (f1 - f0) });
+    }
+    const maxE = rawWins.length ? Math.max(...rawWins.map((w) => w.e)) : 0;
+    const nz = rawWins.filter((w) => w.e > 0.25 * maxE).map((w) => w.e);
+    const usual = nz.length ? medianOf(nz) : 0;
+
+    const anchorsT = [];
+    const anchorsP = [];
+    for (const w of rawWins) {
+      if (w.e < ACTIVE_SHARE * usual || usual <= 1e-4) continue;
+      let bestP = p0;
+      let bestSc = -1;
+      let bestCl = 0;
+      for (let k = -24; k <= 24; k++) {
+        const frac = k * 0.005; // +-12%
+        const p = p0 * (1 + frac);
+        const { clarity } = phaseHistSharpness(bodySmooth, fps, w.f0, w.f1, p, 48);
+        const sc = clarity * (1 - 0.14 * frac * frac * 25);
+        if (sc > bestSc) { bestSc = sc; bestP = p; bestCl = clarity; }
+      }
+      if (bestCl >= 1.9) {
+        anchorsT.push(w.tMid);
+        anchorsP.push(bestP);
+      }
+    }
+
+    const out = new Float32Array(n100);
+    if (anchorsP.length < 2) {
+      out.fill(p0);
+      return out;
+    }
+
+    // 3-point median filter on anchor periods to reject any single fill outlier
+    const cleanP = anchorsP.map((v, i) => {
+      const a = anchorsP[Math.max(0, i - 1)];
+      const b = v;
+      const c = anchorsP[Math.min(anchorsP.length - 1, i + 1)];
+      return medianOf([a, b, c]);
+    });
+
+    // Linearly interpolate local period across every 100 Hz frame
+    let seg = 0;
+    for (let i = 0; i < n100; i++) {
+      const t = i / fps100;
+      if (t <= anchorsT[0]) { out[i] = cleanP[0]; continue; }
+      if (t >= anchorsT[anchorsT.length - 1]) { out[i] = cleanP[cleanP.length - 1]; continue; }
+      while (seg < anchorsT.length - 2 && anchorsT[seg + 1] < t) seg++;
+      const u = (t - anchorsT[seg]) / Math.max(1e-6, anchorsT[seg + 1] - anchorsT[seg]);
+      out[i] = cleanP[seg] + u * (cleanP[seg + 1] - cleanP[seg]);
+    }
+    return out;
+  }
+
+  function trackBeatsDP(env100, fps100, localPeriod, bodySmooth, fps500) {
+    const n = env100.length;
+    if (n < 32) return [];
+
+    // Smooth & normalize onset strength for DP (cap huge crashes so continuity holds through fills)
+    const env = new Float32Array(n);
+    for (let i = 0; i < n; i++) {
+      const a = env100[i > 0 ? i - 1 : 0];
+      const b = env100[i];
+      const c = env100[i + 1 < n ? i + 1 : n - 1];
+      env[i] = 0.25 * a + 0.5 * b + 0.25 * c;
+    }
+    const sorted = Float32Array.from(env).sort();
+    const p98 = sorted[Math.floor(sorted.length * 0.98)] || 1;
+    for (let i = 0; i < n; i++) env[i] = Math.min(2.6, env[i] / p98);
+
+    const C = new Float64Array(n);
+    const back = new Int32Array(n);
+    back.fill(-1);
+    const alpha = 68.0;
+
+    for (let t = 0; t < n; t++) {
+      const lagT = Math.max(15, localPeriod[t] * fps100);
+      const pMin = Math.max(0, Math.round(t - 1.58 * lagT));
+      const pMax = Math.round(t - 0.56 * lagT);
+      if (pMax < 0) {
+        C[t] = env[t];
+        back[t] = -1;
+        continue;
+      }
+      let bestP = -1;
+      let bestSc = -1e18;
+      const invLag = 1.0 / lagT;
+      for (let p = pMin; p <= pMax; p++) {
+        const lr = Math.log((t - p) * invLag);
+        const sc = C[p] - alpha * lr * lr;
+        if (sc > bestSc) { bestSc = sc; bestP = p; }
+      }
+      C[t] = env[t] + bestSc;
+      back[t] = bestP;
+    }
+
+    // Backtrack from best ending beat in final 1.6 beat periods
+    const endLag = Math.max(15, Math.round(localPeriod[n - 1] * fps100 * 1.6));
+    let cur = Math.max(0, n - endLag);
+    for (let i = cur + 1; i < n; i++) {
+      if (C[i] > C[cur]) cur = i;
+    }
+    const rev = [];
+    while (cur >= 0) {
+      rev.push(cur / fps100);
+      cur = back[cur];
+    }
+    rev.reverse();
+
+    // Sub-frame polish each beat onto nearest 500 Hz peak within +-8 ms if clear
+    const w500 = Math.round(0.008 * fps500);
+    const n500 = bodySmooth.length;
+    for (let k = 0; k < rev.length; k++) {
+      const c = Math.round(rev[k] * fps500);
+      const lo = Math.max(1, c - w500);
+      const hi = Math.min(n500 - 2, c + w500);
+      let pk = c;
+      for (let f = lo; f <= hi; f++) if (bodySmooth[f] > bodySmooth[pk]) pk = f;
+      if (pk > lo && pk < hi && bodySmooth[pk] > 1.5 * bodySmooth[c]) {
+        rev[k] = pk / fps500;
+      }
+    }
+    return rev;
+  }
+
+  // ------------------------------------------------------------------ Exact grid.py Post-Processing Helpers
+
+  function recountSlips(beats) {
+    if (beats.length < 12) return [...beats];
+    const p0 = medianDiff(beats);
+    if (p0 <= 0.05) return [...beats];
+    const out = [beats[0]];
+    let i = 1;
+    while (i < beats.length) {
+      const d = beats[i] - out[out.length - 1];
+      if (d < 0.38 * p0) { i++; continue; }
+      if (d >= 0.38 * p0 && d <= 0.58 * p0 && i + 1 < beats.length) {
+        const d2 = beats[i + 1] - beats[i];
+        if (d2 >= 0.38 * p0 && d2 <= 0.62 * p0) {
+          out.push(beats[i + 1]);
+          i += 2;
+          continue;
+        }
+      }
+      if (d >= 1.75 * p0) {
+        const nSub = Math.max(2, Math.round(d / p0));
+        const prev = out[out.length - 1];
+        for (let k = 1; k < nSub; k++) out.push(prev + (d * k) / nSub);
+        out.push(beats[i]);
+        i++;
+        continue;
+      }
+      out.push(beats[i]);
+      i++;
+    }
+    return out;
+  }
+
+  function evenInactiveGaps(beats, activeMask) {
+    const b = [...beats];
+    const n = b.length;
+    let i = 0;
+    while (i < n) {
+      if (activeMask[i]) { i++; continue; }
+      let j = i;
+      while (j < n && !activeMask[j]) j++;
+      if (i > 0 && j < n) {
+        const span = b[j] - b[i - 1];
+        const steps = j - i + 1;
+        for (let k = i; k < j; k++) b[k] = b[i - 1] + (span * (k - i + 1)) / steps;
+      } else if (i === 0 && j < n) {
+        const per = j + 2 < n ? medianDiff(b.slice(j, Math.min(n, j + 16))) : medianDiff(b);
+        for (let k = 0; k < j; k++) b[k] = b[j] - (j - k) * per;
+      } else if (j === n && i > 0) {
+        const per = i >= 2 ? medianDiff(b.slice(Math.max(0, i - 16), i)) : medianDiff(b);
+        for (let k = i; k < n; k++) b[k] = b[i - 1] + (k - i + 1) * per;
+      }
+      i = j;
+    }
+    return b;
+  }
+
+  function gentleHitSnap(beats, activeMask, body, fps, maxShiftS = 0.012) {
+    const b = [...beats];
+    const w = Math.max(1, Math.round(maxShiftS * fps));
+    const ctxW = w * 6;
+    const n = body.length;
+    for (let k = 1; k < b.length - 1; k++) {
+      if (!activeMask[k]) continue;
+      const i = Math.round(b[k] * fps);
+      const lo = Math.max(0, i - w);
+      const hi = Math.min(n, i + w + 1);
+      if (hi - lo < 3) continue;
+      let p = 0;
+      for (let x = 1; x < hi - lo; x++) if (body[lo + x] > body[lo + p]) p = x;
+      const ctxLo = Math.max(0, i - ctxW);
+      const ctxHi = Math.min(n, i + ctxW + 1);
+      const ctxSlice = [];
+      for (let x = ctxLo; x < ctxHi; x += 2) ctxSlice.push(body[x]);
+      const ctxMed = medianOf(ctxSlice);
+      if (body[lo + p] > 2.0 * (ctxMed + 1e-6) && p !== 0 && p !== hi - lo - 1) {
+        const cand = (lo + p) / fps;
+        if (cand > b[k - 1] + 0.15 && cand < b[k + 1] - 0.15) b[k] = cand;
+      }
+    }
+    return b;
+  }
+
+  function runViterbiPass(seed, body, bodySmooth, fps, win = 16, step = 4) {
+    const n = seed.length;
+    const pMed = medianDiff(seed);
+    const winStarts = [];
+    const allE = [];
+    const lastI = Math.max(0, n - win);
+    for (let i = 0; i <= lastI; i += step) {
+      const seg = seed.slice(i, Math.min(n, i + win));
+      const f0 = Math.max(0, Math.floor(seg[0] * fps));
+      const f1 = Math.min(body.length, Math.floor(seg[seg.length - 1] * fps));
+      let s = 0;
+      for (let f = f0; f < f1; f++) s += body[f];
+      winStarts.push(i);
+      allE.push(f1 > f0 ? s / (f1 - f0) : 0);
+    }
+    let maxE = 0;
+    for (const e of allE) if (e > maxE) maxE = e;
+    const nz = allE.filter((e) => e > 0.25 * maxE);
+    const usual = nz.length ? medianOf(nz) : 0;
+
+    const winCenters = [];
+    const winCurves = [];
+    for (let idxW = 0; idxW < winStarts.length; idxW++) {
+      const i = winStarts[idxW];
+      const seg = seed.slice(i, Math.min(n, i + win));
+      if (seg.length < 8) continue;
+      if (allE[idxW] < ACTIVE_SHARE * usual || usual <= 1e-4) continue;
+      const { clarityCurve } = windowPhaseProfile(seg, bodySmooth, fps);
+      let cMax = 0;
+      for (let d = 0; d < N_DELTAS; d++) if (clarityCurve[d] > cMax) cMax = clarityCurve[d];
+      if (cMax >= 1.5) {
+        winCenters.push(i + 0.5 * (seg.length - 1));
+        winCurves.push(clarityCurve);
+      }
+    }
+
+    const activeMask = new Uint8Array(n);
+    for (const cIdx of winCenters) {
+      const lo = Math.max(0, Math.floor(cIdx - win * 0.5));
+      const hi = Math.min(n, Math.ceil(cIdx + win * 0.5));
+      for (let k = lo; k < hi; k++) activeMask[k] = 1;
+    }
+
+    if (winCenters.length === 0) return { cand: [...seed], activeMask, winCount: 0 };
+    if (winCenters.length === 1) {
+      let best = 0;
+      for (let d = 1; d < N_DELTAS; d++) if (winCurves[0][d] > winCurves[0][best]) best = d;
+      const offS = DELTAS[best] * pMed;
+      return { cand: seed.map((x) => x + offS), activeMask, winCount: 1 };
+    }
+
+    const wo = viterbiPhaseTrack(winCurves, winCenters, pMed);
+    // Interpolate wo across all beats 0..n-1
+    const offCurve = new Float64Array(n);
+    let seg = 0;
+    for (let j = 0; j < n; j++) {
+      if (j <= winCenters[0]) { offCurve[j] = wo[0]; continue; }
+      if (j >= winCenters[winCenters.length - 1]) { offCurve[j] = wo[wo.length - 1]; continue; }
+      while (seg < winCenters.length - 2 && winCenters[seg + 1] < j) seg++;
+      const u = (j - winCenters[seg]) / Math.max(1e-6, winCenters[seg + 1] - winCenters[seg]);
+      offCurve[j] = wo[seg] + u * (wo[seg + 1] - wo[seg]);
+    }
+    // Compact 7-beat Hanning smooth (matching grid.py)
+    const kerLen = Math.min(7, Math.max(3, Math.floor(n / 16) | 1));
+    const half = kerLen >> 1;
+    const ker = new Float64Array(kerLen);
+    let kSum = 0;
+    for (let k = 0; k < kerLen; k++) {
+      ker[k] = 0.5 * (1 - Math.cos((2 * Math.PI * (k + 1)) / (kerLen + 1)));
+      kSum += ker[k];
+    }
+    for (let k = 0; k < kerLen; k++) ker[k] /= kSum;
+
+    const cand = new Array(n);
+    for (let j = 0; j < n; j++) {
+      let acc = 0;
+      for (let k = -half; k <= half; k++) {
+        const idx = Math.max(0, Math.min(n - 1, j + k));
+        acc += offCurve[idx] * ker[k + half];
+      }
+      cand[j] = seed[j] + acc;
+    }
+
+    // Enforce strict monotonic spacing
+    const minGap = 0.35 * pMed;
+    for (let k = 1; k < n; k++) {
+      if (cand[k] < cand[k - 1] + minGap) cand[k] = cand[k - 1] + minGap;
+    }
+    return { cand, activeMask, winCount: winCenters.length };
+  }
+
+  function detectAndBuildGrid(left, right, sid, title, opts = {}) {
     const n = Math.min(left.length, right.length);
     const mono = new Float32Array(n);
     for (let i = 0; i < n; i++) mono[i] = 0.5 * (left[i] + right[i]);
     const dur = n / SR;
-    const { body, kick, fps } = onsetCurve200Hz(mono, SR);
+    const bpb = Number(opts.bpb || 4);
+    const preferBpm = opts.preferBpm ? Number(opts.preferBpm) : null;
 
-    // Autocorrelation over 68..180 BPM
-    const loLag = Math.max(1, Math.round((fps * 60) / 180));
-    const hiLag = Math.min(body.length - 1, Math.round((fps * 60) / 68));
-    let mean = 0;
-    for (let i = 0; i < body.length; i++) mean += body[i];
-    mean /= body.length || 1;
-    let bestLag = Math.round((fps * 60) / 120);
-    let bestScore = -1;
-    const stepCheck = Math.min(body.length, fps * 90); // analyze up to 90s for fast autocorrelation
-    for (let lag = loLag; lag <= hiLag; lag++) {
-      let s = 0;
-      for (let i = 0; i < stepCheck - lag; i += 2) {
-        s += (body[i] - mean) * (body[i + lag] - mean);
+    const { body, bodySmooth, kick, fps } = onsetCurves500Hz(mono, SR);
+    const { period: p0, env100, fps100 } = estimateGlobalPeriod(body, bodySmooth, fps, preferBpm);
+    const localPeriod = buildLocalPeriodCurve(body, bodySmooth, fps, p0, env100.length, fps100);
+    let seed = trackBeatsDP(env100, fps100, localPeriod, bodySmooth, fps);
+    if (seed.length < 8) {
+      seed = [];
+      for (let t = 0; t <= dur + 0.02; t += p0) seed.push(t);
+    }
+    seed = recountSlips(seed);
+
+    // Continuity-constrained Viterbi DP pass 1 (16-beat windows, step 4)
+    let pass = runViterbiPass(seed, body, bodySmooth, fps, 16, 4);
+    let candFollow = pass.cand;
+    let activeMask = pass.activeMask;
+    let audFollow = auditBeatsJS(candFollow, body, bodySmooth, fps);
+
+    // If any section still shows >22 ms offset (e.g. abrupt tempo change), run tighter 12-beat Viterbi pass 2!
+    if (pass.winCount >= 2 && (audFollow.bad_windows > 0 || audFollow.max_offset_ms > OFFBEAT_WARN_MS)) {
+      const pass2 = runViterbiPass(recountSlips(candFollow), body, bodySmooth, fps, 12, 4);
+      const aud2 = auditBeatsJS(pass2.cand, body, bodySmooth, fps);
+      if (aud2.bad_windows < audFollow.bad_windows
+        || (aud2.bad_windows === audFollow.bad_windows && aud2.max_offset_ms < audFollow.max_offset_ms - 2.0)) {
+        candFollow = pass2.cand;
+        activeMask = pass2.activeMask;
+        audFollow = aud2;
       }
-      // Slight musical prior favoring 85..155 BPM over double/half extremes
-      const candBpm = (fps * 60) / lag;
-      const prior = candBpm >= 85 && candBpm <= 155 ? 1.08 : 1.0;
-      if (s * prior > bestScore) { bestScore = s * prior; bestLag = lag; }
-    }
-    let period = bestLag / fps;
-
-    // Best global phase offset in [0, period)
-    let bestPh = 0, bestPhScore = -1;
-    for (let ph = 0; ph < bestLag; ph++) {
-      let s = 0;
-      for (let i = ph; i < body.length; i += bestLag) s += body[i];
-      if (s > bestPhScore) { bestPhScore = s; bestPh = ph; }
-    }
-    const t0 = bestPh / fps;
-    const seed = [];
-    for (let t = t0; t <= dur + 0.02; t += period) seed.push(t);
-
-    // Local 16-beat phase refinement + fine snap
-    const beats = [...seed];
-    const aud0 = auditBeatsJS(beats, body, fps);
-    if (aud0.active_windows > 0 && Math.abs(aud0.signed_median_ms) > 2) {
-      const shift = aud0.signed_median_ms / 1000;
-      for (let i = 0; i < beats.length; i++) beats[i] = Math.max(0, beats[i] + shift);
     }
 
-    // Pick downbeat phase mod 4 by strongest kick energy
-    const kickScores = [0, 0, 0, 0];
-    for (let ph = 0; ph < 4; ph++) {
+    let fixed = candFollow;
+    let action = pass.winCount >= 2 ? "drift_tracked" : (pass.winCount === 1 ? "phase_shifted" : "verified");
+
+    if (pass.winCount >= 2 && candFollow.length >= 8) {
+      // Robust IRLS straight-line fit on active beats (exact port of grid.py)
+      const actJ = [], actT = [];
+      for (let j = 0; j < candFollow.length; j++) {
+        if (activeMask[j]) { actJ.push(j); actT.push(candFollow[j]); }
+      }
+      if (actJ.length >= 8) {
+        let { slope, intercept } = linearFit(actJ, actT);
+        const res = actJ.map((j, idx) => Math.abs(actT[idx] - (intercept + slope * j)));
+        const thr = Math.max(0.018, percentileOf(res, 75) * 1.8);
+        const inJ = [], inT = [];
+        for (let k = 0; k < actJ.length; k++) {
+          if (res[k] <= thr) { inJ.push(actJ[k]); inT.push(actT[k]); }
+        }
+        if (inJ.length >= 8) ({ slope, intercept } = linearFit(inJ, inT));
+
+        const candStraight = Array.from({ length: candFollow.length }, (_, j) => intercept + slope * j);
+        const straightDev = percentileOf(
+          actJ.map((j, idx) => Math.abs(actT[idx] - candStraight[j]) * 1000),
+          85,
+        );
+        const audStraight = auditBeatsJS(candStraight, body, bodySmooth, fps);
+
+        if (
+          straightDev <= 14.0
+          && audStraight.median_offset_ms <= Math.max(10.0, audFollow.median_offset_ms + 4.0)
+          && audStraight.bad_windows <= audFollow.bad_windows
+        ) {
+          fixed = candStraight;
+          action = "steady_locked";
+        } else {
+          fixed = evenInactiveGaps(candFollow, activeMask);
+          fixed = gentleHitSnap(fixed, activeMask, body, fps, 0.012);
+          action = "drift_tracked";
+        }
+      }
+    }
+
+    // Trim / extend cleanly to cover [0, dur]
+    const pStart = medianDiff(fixed.slice(0, Math.min(fixed.length, 16)));
+    const pEnd = medianDiff(fixed.slice(Math.max(0, fixed.length - 16)));
+    while (fixed.length && fixed[0] - pStart >= 0.0) fixed.unshift(fixed[0] - pStart);
+    while (fixed.length > 2 && fixed[0] < 0.0) fixed.shift();
+    while (fixed.length && fixed[fixed.length - 1] + pEnd <= dur + 0.05) fixed.push(fixed[fixed.length - 1] + pEnd);
+
+    // Pick downbeat phase mod bpb by strongest kick energy (within +-18 ms window)
+    const rKick = Math.max(1, Math.round(0.018 * fps));
+    const kickScores = new Float64Array(bpb);
+    for (let ph = 0; ph < bpb; ph++) {
       let s = 0, c = 0;
-      for (let i = ph; i < beats.length; i += 4) {
-        const fr = Math.round(beats[i] * fps);
-        if (fr >= 1 && fr < kick.length - 1) {
-          s += Math.max(kick[fr - 1], kick[fr], kick[fr + 1]);
+      for (let i = ph; i < fixed.length; i += bpb) {
+        const center = Math.round(fixed[i] * fps);
+        if (center >= 0 && center < kick.length) {
+          let mx = 0;
+          const lo = Math.max(0, center - rKick);
+          const hi = Math.min(kick.length - 1, center + rKick);
+          for (let f = lo; f <= hi; f++) if (kick[f] > mx) mx = kick[f];
+          s += mx;
           c++;
         }
       }
       kickScores[ph] = c ? s / c : 0;
     }
     let downOff = 0;
-    for (let ph = 1; ph < 4; ph++) if (kickScores[ph] > kickScores[downOff]) downOff = ph;
+    for (let ph = 1; ph < bpb; ph++) if (kickScores[ph] > kickScores[downOff]) downOff = ph;
     const bars = [];
-    for (let i = downOff; i < beats.length; i += 4) bars.push(i);
+    for (let i = downOff; i < fixed.length; i += bpb) bars.push(i);
 
-    const audit = auditBeatsJS(beats, body, fps);
-    audit.note = `Browser-verified against full-band drum hits (${audit.median_offset_ms.toFixed(1)} ms median)`;
-    const bpm = +(60 / period).toFixed(4);
-    const sig = `b${beats.length}_${Math.round(bpm * 10)}_${downOff}`;
+    const audit = auditBeatsJS(fixed, body, bodySmooth, fps);
+    const notes = [];
+    if (audit.needs_quantize) {
+      notes.push(`Song drifts ${audit.drift_pct.toFixed(1)}% (${audit.max_straight_err_ms.toFixed(0)} ms) — click Quantize to lock onto steady grid`);
+    } else {
+      notes.push(`Browser-verified against full-band drum hits (${audit.median_offset_ms.toFixed(1)} ms median, ${action})`);
+    }
+    audit.note = notes.join("; ");
 
-    return {
+    const bpm = +(60 / medianDiff(fixed)).toFixed(4);
+    const grid = {
       sid,
       title,
       bpm,
-      bpb: 4,
+      bpb,
       downbeat_offset: downOff,
-      beats: beats.map((x) => +x.toFixed(5)),
+      beats: fixed.map((x) => +x.toFixed(5)),
       bars,
       duration: +dur.toFixed(4),
-      mode: "steady_locked",
-      onset_source: "drums",
+      mode: action,
+      onset_source: opts.onsetSource || "drums",
       updated: Date.now() / 1000,
       audit,
       quantized: null,
-      sig,
     };
+    grid.sig = gridSigJS(grid);
+    return grid;
   }
 
+  // ------------------------------------------------------------------ Key Detection (Goertzel Chroma)
+
   function detectKeyCamelot(left, right) {
-    // Simple lightweight DFT chroma at 12 pitch classes over 65..1800 Hz (4x decimated)
     const n = Math.min(left.length, right.length, SR * 45);
     if (n < SR * 2) return { name: "", camelot: "", tonic: 0, mode: "minor" };
     const dec = 8;
@@ -452,7 +1217,6 @@
     const y = new Float32Array(m);
     for (let i = 0; i < m; i++) y[i] = 0.5 * (left[i * dec] + right[i * dec]);
 
-    // Goertzel energy across 4 octaves of 12 semitones (MIDI 36..83)
     const chroma = new Float64Array(12);
     const block = 2048;
     const step = 4096;
@@ -498,27 +1262,52 @@
     return { name: `${NAMES[bt]} ${bm}`, camelot: bm === "major" ? CMAJ[bt] : CMIN[bt], tonic: bt, mode: bm };
   }
 
+  // ------------------------------------------------------------------ Cubic Catmull-Rom Beat-Map Resampler
+
   function resampleTimeMap(left, right, srcBeats, dstBeats, sr = SR) {
     const nIn = Math.min(left.length, right.length);
-    const lastSrc = srcBeats[srcBeats.length - 1];
-    const lastDst = dstBeats[dstBeats.length - 1];
-    const nOut = Math.max(1, Math.ceil((nIn / sr - lastSrc + lastDst) * sr));
+    const nb = srcBeats.length;
+    const slopeStart = (srcBeats[1] - srcBeats[0]) / Math.max(1e-6, dstBeats[1] - dstBeats[0]);
+    const slopeEnd = (srcBeats[nb - 1] - srcBeats[nb - 2]) / Math.max(1e-6, dstBeats[nb - 1] - dstBeats[nb - 2]);
+    const lastSrc = srcBeats[nb - 1];
+    const lastDst = dstBeats[nb - 1];
+    const outSec = lastDst + (nIn / sr - lastSrc) / Math.max(0.25, slopeEnd);
+    const nOut = Math.max(1, Math.ceil(outSec * sr));
     const outL = new Float32Array(nOut);
     const outR = new Float32Array(nOut);
-    const nb = srcBeats.length;
+
+    const dFirst = dstBeats[0], sFirst = srcBeats[0];
     let seg = 0;
     for (let i = 0; i < nOut; i++) {
       const td = i / sr;
-      while (seg < nb - 2 && dstBeats[seg + 1] < td) seg++;
-      const d0 = dstBeats[seg], d1 = dstBeats[seg + 1];
-      const s0 = srcBeats[seg], s1 = srcBeats[seg + 1];
-      const u = (td - d0) / Math.max(1e-6, d1 - d0);
-      const p = (s0 + u * (s1 - s0)) * sr;
-      const i0 = Math.floor(p);
-      const fr = p - i0;
-      if (i0 >= 0 && i0 + 1 < nIn) {
-        outL[i] = left[i0] * (1 - fr) + left[i0 + 1] * fr;
-        outR[i] = right[i0] * (1 - fr) + right[i0 + 1] * fr;
+      let ts;
+      if (td < dFirst) {
+        ts = sFirst + (td - dFirst) * slopeStart;
+      } else if (td >= lastDst) {
+        ts = lastSrc + (td - lastDst) * slopeEnd;
+      } else {
+        while (seg < nb - 2 && dstBeats[seg + 1] < td) seg++;
+        const d0 = dstBeats[seg], d1 = dstBeats[seg + 1];
+        const s0 = srcBeats[seg], s1 = srcBeats[seg + 1];
+        const u = (td - d0) / Math.max(1e-6, d1 - d0);
+        ts = s0 + u * (s1 - s0);
+      }
+      const p = ts * sr;
+      const i1 = Math.floor(p);
+      const t = p - i1;
+      if (i1 >= 1 && i1 + 2 < nIn) {
+        // 4-point Catmull-Rom cubic interpolation (preserves sharp drum/cymbal highs!)
+        const t2 = t * t;
+        const t3 = t2 * t;
+        const w0 = -0.5 * t3 + t2 - 0.5 * t;
+        const w1 = 1.5 * t3 - 2.5 * t2 + 1.0;
+        const w2 = -1.5 * t3 + 2.0 * t2 + 0.5 * t;
+        const w3 = 0.5 * t3 - 0.5 * t2;
+        outL[i] = w0 * left[i1 - 1] + w1 * left[i1] + w2 * left[i1 + 1] + w3 * left[i1 + 2];
+        outR[i] = w0 * right[i1 - 1] + w1 * right[i1] + w2 * right[i1 + 1] + w3 * right[i1 + 2];
+      } else if (i1 >= 0 && i1 + 1 < nIn) {
+        outL[i] = left[i1] * (1 - t) + left[i1 + 1] * t;
+        outR[i] = right[i1] * (1 - t) + right[i1 + 1] * t;
       }
     }
     return { left: outL, right: outR };
@@ -611,7 +1400,57 @@
     };
   }
 
-  // ------------------------------------------------------------------ High-Level Browser Local Import & Quantize
+  // ------------------------------------------------------------------ Helper: Load Local Song Beat Audio (Drums or Mix Fallback)
+
+  function arrayRms(arr) {
+    let s = 0;
+    const step = arr.length > 441000 ? 4 : 1;
+    let c = 0;
+    for (let i = 0; i < arr.length; i += step) { s += arr[i] * arr[i]; c++; }
+    return Math.sqrt(s / Math.max(1, c));
+  }
+
+  async function loadLocalBeatStereo(sid, rev = "raw") {
+    const dBlob = await dbGet("blobs", `${sid}|${rev}|drums`);
+    if (dBlob) {
+      const dec = await decodeTo44kStereo(await dBlob.arrayBuffer());
+      if (arrayRms(dec.left) >= 1e-4 || arrayRms(dec.right) >= 1e-4) {
+        return { left: dec.left, right: dec.right, source: "drums" };
+      }
+    }
+    // Drumless / direct track fallback: mix available stems
+    const parts = [];
+    for (const st of ["bass", "other", "vocals"]) {
+      const b = await dbGet("blobs", `${sid}|${rev}|${st}`);
+      if (b) parts.push(await decodeTo44kStereo(await b.arrayBuffer()));
+    }
+    if (!parts.length) throw new Error("Local audio stems missing from IndexedDB");
+    const n = Math.min(...parts.map((p) => p.left.length));
+    const L = new Float32Array(n);
+    const R = new Float32Array(n);
+    for (const p of parts) {
+      for (let i = 0; i < n; i++) { L[i] += p.left[i]; R[i] += p.right[i]; }
+    }
+    return { left: L, right: R, source: "mix" };
+  }
+
+  async function saveLocalGridToDB(sid, grid) {
+    const rec = await dbGet("songs", sid);
+    if (!rec) return;
+    rec.detail.grid = grid;
+    rec.summary.bpm = +Number(grid.bpm).toFixed(2);
+    rec.summary.bpb = grid.bpb;
+    rec.summary.core_grid = {
+      bpm: grid.bpm,
+      bpb: grid.bpb,
+      audit: grid.audit,
+      quantized: Boolean(grid.quantized && grid.quantized.sig === grid.sig),
+      sig: grid.sig,
+    };
+    await dbPut("songs", rec);
+  }
+
+  // ------------------------------------------------------------------ High-Level Browser Local Import, Grid Auto-Fix, Update & Quantize
 
   async function importFilesLocal(files, { mode = "ai", singleRole = "other", title = "" } = {}, onProgress = () => {}) {
     const fileArr = [...files];
@@ -624,17 +1463,22 @@
     let duration = 0;
 
     if (fileArr.length >= 2) {
-      // Multi-file stem pack import (pair *drums*, *bass*, *other*/*inst*, *vocals*)
       onProgress(0.10, `Decoding ${fileArr.length} pre-separated stem files...`);
       const assigned = {};
+      const unassigned = [];
       for (const f of fileArr) {
         const nm = f.name.toLowerCase();
         const dec = await decodeTo44kStereo(f);
         duration = Math.max(duration, dec.duration);
-        if (nm.includes("drum")) assigned.drums = dec;
-        else if (nm.includes("bass")) assigned.bass = dec;
-        else if (nm.includes("vocal") || nm.includes("acapella")) assigned.vocals = dec;
-        else if (!assigned.other) assigned.other = dec;
+        if ((nm.includes("drum") || nm.includes("perc")) && !assigned.drums) assigned.drums = dec;
+        else if (nm.includes("bass") && !assigned.bass) assigned.bass = dec;
+        else if ((nm.includes("vocal") || nm.includes("vox") || nm.includes("acapella")) && !assigned.vocals) assigned.vocals = dec;
+        else if ((nm.includes("other") || nm.includes("inst") || nm.includes("music") || nm.includes("melod") || nm.includes("guitar") || nm.includes("synth")) && !assigned.other) assigned.other = dec;
+        else unassigned.push(dec);
+      }
+      for (const u of unassigned) {
+        const slot = STEMS.find((s) => !assigned[s]);
+        if (slot) assigned[slot] = u;
       }
       const nSamp = Math.max(1, Math.ceil(duration * SR));
       const pad = (x) => {
@@ -653,24 +1497,31 @@
         stems = { drums: out.drums, bass: out.bass, other: out.other, vocals: out.vocals };
         sepTag = out.tag;
       } else {
-        // Fast zero-AI single-track import
         const zero = () => ({ left: new Float32Array(dec.left.length), right: new Float32Array(dec.right.length) });
         stems = { drums: zero(), bass: zero(), other: zero(), vocals: zero() };
-        if (singleRole === "mix") {
-          stems.other = dec;
-        } else {
-          stems[STEMS.includes(singleRole) ? singleRole : "other"] = dec;
-        }
+        if (singleRole === "mix") stems.other = dec;
+        else stems[STEMS.includes(singleRole) ? singleRole : "other"] = dec;
         sepTag = "browser_direct";
       }
     }
 
-    onProgress(0.90, "Running zero-phase drum beat audit & Camelot key detection...");
-    // Use drums stem if non-silent, else mix of all stems for beat analysis
-    const hasDrums = stems.drums.left.some((v) => Math.abs(v) > 1e-3);
-    const beatL = hasDrums ? stems.drums.left : stems.other.left;
-    const beatR = hasDrums ? stems.drums.right : stems.other.right;
-    const grid = detectAndBuildGrid(beatL, beatR, sid, baseName);
+    onProgress(0.88, "Running Viterbi drum-hit beat tracker & Camelot key detection...");
+    const hasDrums = arrayRms(stems.drums.left) >= 1e-4 || arrayRms(stems.drums.right) >= 1e-4;
+    let beatL, beatR, onsetSource = "drums";
+    if (hasDrums) {
+      beatL = stems.drums.left;
+      beatR = stems.drums.right;
+    } else {
+      onsetSource = "mix";
+      const nS = stems.other.left.length;
+      beatL = new Float32Array(nS);
+      beatR = new Float32Array(nS);
+      for (let i = 0; i < nS; i++) {
+        beatL[i] = stems.bass.left[i] + stems.other.left[i] + stems.vocals.left[i];
+        beatR[i] = stems.bass.right[i] + stems.other.right[i] + stems.vocals.right[i];
+      }
+    }
+    const grid = detectAndBuildGrid(beatL, beatR, sid, baseName, { onsetSource });
 
     const harmL = new Float32Array(stems.other.left.length);
     const harmR = new Float32Array(stems.other.right.length);
@@ -680,7 +1531,7 @@
     }
     const keyInfo = detectKeyCamelot(harmL, harmR);
 
-    onProgress(0.95, "Saving stems & peaks to private browser IndexedDB storage...");
+    onProgress(0.94, "Saving stems & peaks to private browser IndexedDB storage...");
     for (const st of STEMS) {
       const wavBlob = encodeStereoWav16(stems[st].left, stems[st].right, SR);
       const pk = computePeaksI8(stems[st].left, stems[st].right, SR, 100);
@@ -706,7 +1557,7 @@
       separation: sepTag,
       created: Date.now() / 1000,
       loudness: {},
-      has_vocals: stems.vocals.left.some((v) => Math.abs(v) > 1e-3),
+      has_vocals: arrayRms(stems.vocals.left) >= 1e-4,
       core_grid: { bpm: grid.bpm, bpb: grid.bpb, audit: grid.audit, quantized: false, sig: grid.sig },
     };
 
@@ -731,56 +1582,178 @@
     return { sid, summary: songSummary, detail };
   }
 
+  async function autoFixLocalGrid(detail) {
+    const sid = detail.id;
+    const prev = detail.grid || {};
+    const { left, right, source } = await loadLocalBeatStereo(sid, "raw");
+    const preferBpm = prev._userOctaveBpm || null;
+    const grid = detectAndBuildGrid(left, right, sid, detail.title || sid, {
+      bpb: prev.bpb || 4,
+      preferBpm,
+      onsetSource: source,
+    });
+    if (preferBpm) grid._userOctaveBpm = preferBpm;
+    detail.grid = grid;
+    await saveLocalGridToDB(sid, grid);
+    return grid;
+  }
+
+  async function updateLocalGrid(detail, payload = {}) {
+    const sid = detail.id;
+    const g = detail.grid;
+    if (!g?.beats?.length) throw new Error("Grid missing");
+    const bpb = Number(payload.bpb || g.bpb || 4);
+    let beats = [...g.beats];
+
+    if (payload.nudge_ms) {
+      const dt = Number(payload.nudge_ms) / 1000;
+      beats = beats.map((x) => +(x + dt).toFixed(5)).filter((x) => x >= 0);
+    }
+    const factor = Number(payload.factor || 1);
+    if (Math.abs(factor - 2) < 1e-3) {
+      const out = [];
+      for (let i = 0; i < beats.length - 1; i++) {
+        out.push(beats[i], +((beats[i] + beats[i + 1]) * 0.5).toFixed(5));
+      }
+      out.push(beats[beats.length - 1]);
+      beats = out;
+    } else if (Math.abs(factor - 0.5) < 1e-3 && beats.length >= 8) {
+      const off = Number(g.downbeat_offset || 0) % 2;
+      beats = beats.filter((_, i) => i % 2 === off);
+    }
+
+    const downOff = ((Number(g.downbeat_offset || 0) + Number(payload.downbeat_shift || 0)) % bpb + bpb) % bpb;
+    const bars = [];
+    for (let i = downOff; i < beats.length; i += bpb) bars.push(i);
+    const bpm = +(60 / medianDiff(beats)).toFixed(4);
+
+    // Re-audit immediately against REAL stored drum hits so UI stays 100% honest!
+    const { left, right } = await loadLocalBeatStereo(sid, "raw");
+    const n = Math.min(left.length, right.length);
+    const mono = new Float32Array(n);
+    for (let i = 0; i < n; i++) mono[i] = 0.5 * (left[i] + right[i]);
+    const { body, bodySmooth, fps } = onsetCurves500Hz(mono, SR);
+    const aud = auditBeatsJS(beats, body, bodySmooth, fps);
+    aud.note = `User adjusted (${aud.median_offset_ms.toFixed(1)} ms median vs drum hits)`;
+
+    g.beats = beats;
+    g.bars = bars;
+    g.bpb = bpb;
+    g.downbeat_offset = downOff;
+    g.bpm = bpm;
+    g.mode = "user";
+    g.audit = aud;
+    g.updated = Date.now() / 1000;
+    if (Math.abs(factor - 2) < 1e-3 || Math.abs(factor - 0.5) < 1e-3) {
+      g._userOctaveBpm = bpm;
+    }
+    const newSig = gridSigJS(g);
+    g.sig = newSig;
+    if (g.quantized && g.quantized.sig !== newSig) g.quantized = null;
+
+    await saveLocalGridToDB(sid, g);
+    return g;
+  }
+
+  const tick = () => new Promise((r) => setTimeout(r, 0));
+
   async function quantizeLocalSong(detail, onProgress = () => {}) {
     const sid = detail.id;
     const g = detail.grid;
     const beats = g.beats;
     if (!beats || beats.length < 8) throw new Error("Not enough beats to quantize");
-    const diffs = [];
-    for (let i = 1; i < beats.length; i++) diffs.push(beats[i] - beats[i - 1]);
-    diffs.sort((a, b) => a - b);
-    const period = diffs[diffs.length >> 1];
-    const t0 = beats[0];
-    const dstBeats = beats.map((_, j) => t0 + j * period);
+
+    const period = medianDiff(beats);
+    let t0 = beats[0];
+    let dstBeats = beats.map((_, j) => t0 + j * period);
+    const oldRev = g.quantized?.rev || null;
     const rev = `Q_${g.sig}_${Math.floor(Date.now() / 1000)}`;
 
-    let qDrumsMono = null;
+    const rendered = {};
     for (let k = 0; k < STEMS.length; k++) {
       const st = STEMS[k];
-      onProgress(0.1 + 0.75 * (k / 4), `Quantizing ${st} (${k + 1}/4)...`);
+      onProgress(0.08 + 0.72 * (k / 4), `Quantizing ${st} (${k + 1}/4)...`);
+      await tick();
       const blob = await dbGet("blobs", `${sid}|raw|${st}`);
       if (!blob) throw new Error(`Missing local stem blob for ${st}`);
       const dec = await decodeTo44kStereo(await blob.arrayBuffer());
-      const q = resampleTimeMap(dec.left, dec.right, beats, dstBeats, SR);
-      if (st === "drums") {
-        qDrumsMono = new Float32Array(q.left.length);
-        for (let i = 0; i < q.left.length; i++) qDrumsMono[i] = 0.5 * (q.left[i] + q.right[i]);
-      }
-      await dbPut("blobs", encodeStereoWav16(q.left, q.right, SR), `${sid}|${rev}|${st}`);
-      await dbPut("blobs", computePeaksI8(q.left, q.right, SR, 100), `pk|${sid}|${rev}|${st}`);
+      rendered[st] = resampleTimeMap(dec.left, dec.right, beats, dstBeats, SR);
     }
 
-    onProgress(0.90, "Verifying quantized drum hits...");
-    const { body, fps } = onsetCurve200Hz(qDrumsMono, SR);
-    const qAud = auditBeatsJS(dstBeats, body, fps);
+    // Align lengths across all 4 quantized stems & normalize peak safely if > 0.98
+    const nMin = Math.min(...STEMS.map((st) => rendered[st].left.length));
+    let peak = 0;
+    for (const st of STEMS) {
+      const L = rendered[st].left, R = rendered[st].right;
+      for (let i = 0; i < nMin; i++) {
+        const a = Math.abs(L[i]), b = Math.abs(R[i]);
+        if (a > peak) peak = a;
+        if (b > peak) peak = b;
+      }
+    }
+    const scale = peak > 0.98 ? +(Math.min(1.0, 0.96 / peak)).toFixed(6) : 1.0;
+
+    for (const st of STEMS) {
+      let L = rendered[st].left.subarray(0, nMin);
+      let R = rendered[st].right.subarray(0, nMin);
+      if (scale < 1.0) {
+        const sL = new Float32Array(nMin), sR = new Float32Array(nMin);
+        for (let i = 0; i < nMin; i++) { sL[i] = L[i] * scale; sR[i] = R[i] * scale; }
+        L = sL; R = sR;
+      }
+      await dbPut("blobs", encodeStereoWav16(L, R, SR), `${sid}|${rev}|${st}`);
+      await dbPut("blobs", computePeaksI8(L, R, SR, 100), `pk|${sid}|${rev}|${st}`);
+    }
+
+    onProgress(0.88, "Verifying quantized drum hits against grid...");
+    await tick();
+    const qDrumsMono = new Float32Array(nMin);
+    const hasQDrums = arrayRms(rendered.drums.left) >= 1e-4 || arrayRms(rendered.drums.right) >= 1e-4;
+    if (hasQDrums) {
+      for (let i = 0; i < nMin; i++) qDrumsMono[i] = 0.5 * (rendered.drums.left[i] + rendered.drums.right[i]);
+    } else {
+      for (let i = 0; i < nMin; i++) {
+        qDrumsMono[i] = 0.5 * (
+          rendered.bass.left[i] + rendered.bass.right[i]
+          + rendered.other.left[i] + rendered.other.right[i]
+          + rendered.vocals.left[i] + rendered.vocals.right[i]
+        );
+      }
+    }
+
+    const { body, bodySmooth, fps } = onsetCurves500Hz(qDrumsMono, SR);
+    let qAud = auditBeatsJS(dstBeats, body, bodySmooth, fps);
+    // Lock residual uniform offset (3..25 ms) dead-center onto real hits (matching quantize.py!)
+    const resMs = Number(qAud.signed_median_ms || 0);
+    if (Math.abs(resMs) >= 3.0 && Math.abs(resMs) <= 25.0 && (t0 + resMs / 1000) >= 0) {
+      t0 += resMs / 1000;
+      dstBeats = beats.map((_, j) => t0 + j * period);
+      qAud = auditBeatsJS(dstBeats, body, bodySmooth, fps);
+    }
+    qAud.note = `Verified quantized audio: ${qAud.median_offset_ms.toFixed(1)} ms median (max ${qAud.max_offset_ms.toFixed(1)} ms across ${qAud.active_windows} sections)`;
+
+    // Clean up older quantized blobs from IndexedDB so SSD storage stays lean
+    if (oldRev && oldRev !== rev) {
+      for (const st of STEMS) {
+        try { await dbDelete("blobs", `${sid}|${oldRev}|${st}`); } catch {}
+        try { await dbDelete("blobs", `pk|${sid}|${oldRev}|${st}`); } catch {}
+      }
+    }
+
     g.quantized = {
       rev,
       sig: g.sig,
       bpm: +(60 / period).toFixed(4),
       period,
       t0: +t0.toFixed(6),
+      n_samples: nMin,
       n_beats: dstBeats.length,
-      scale: 1.0,
+      scale,
       audit: qAud,
       created: Date.now() / 1000,
     };
-    const rec = await dbGet("songs", sid);
-    if (rec) {
-      rec.detail.grid = g;
-      rec.summary.core_grid = { bpm: g.bpm, bpb: g.bpb, audit: g.audit, quantized: true, sig: g.sig };
-      await dbPut("songs", rec);
-    }
-    onProgress(1.0, `Quantized & verified (${qAud.median_offset_ms} ms)`);
+    await saveLocalGridToDB(sid, g);
+    onProgress(1.0, `Quantized & verified (${qAud.median_offset_ms.toFixed(1)} ms)`);
     return g;
   }
 
@@ -794,14 +1767,18 @@
     await dbClearStore("blobs");
   }
 
-  window.RetexBrowserDSP = {
+  ROOT.RetexBrowserDSP = {
     detectHardware,
     hasCachedModel,
     clearModelCache,
     clearAllLocalImports,
     importFilesLocal,
+    autoFixLocalGrid,
+    updateLocalGrid,
     quantizeLocalSong,
     getAllLocalSongs: () => dbGetAll("songs"),
     getBlob: (key) => dbGet("blobs", key),
+    // Exposed pure-DSP helpers for verification/benchmarking
+    _dsp: { onsetCurves500Hz, detectAndBuildGrid, auditBeatsJS, resampleTimeMap, gridSigJS },
   };
 })();
