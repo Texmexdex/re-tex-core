@@ -757,7 +757,8 @@ function handleEvent(msg) {
           resEl.classList.remove("hidden");
           const lufs = res.lufs !== undefined ? ` · ${Number(res.lufs).toFixed(1)} LUFS` : "";
           const peak = res.peak_db !== undefined ? ` · peak ${Number(res.peak_db).toFixed(1)} dBFS` : "";
-          resEl.innerHTML = `Saved: <a href="/api/exports/${encodeURIComponent(res.file)}" style="color:#2ee06e" download>${res.file}</a>${lufs}${peak}`;
+          const href = res.blob_url || `/api/exports/${encodeURIComponent(res.file)}`;
+          resEl.innerHTML = `Saved: <a href="${href}" style="color:#2ee06e" download="${res.file}">${res.file}</a>${lufs}${peak}`;
         }
         api.toast(`Export complete: ${res.file}`, "ok");
       }

@@ -1,0 +1,292 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Re-Tex Core — Live Browser Demo</title>
+  <link rel="icon" href="./img/retex.ico" />
+  <link rel="stylesheet" href="./app.css" />
+</head>
+<body>
+  <div id="app">
+    <!-- Top Transport & Project Bar -->
+    <header id="topbar">
+      <div class="tb-group tb-brand">
+        <span class="brand-dot"></span>
+        <span class="brand-name">RE-TEX CORE</span>
+        <select id="projectSelect" title="Open project"></select>
+        <input id="projectName" type="text" value="Untitled Mashup" spellcheck="false" title="Project name" />
+        <button id="btnNewProj" class="btn-ghost" title="New empty project">New</button>
+        <button id="btnBranchProj" class="btn-ghost" title="Branch current project">Branch</button>
+        <button id="btnSaveProj" class="btn-ghost" title="Save project (Ctrl+S)">Save</button>
+      </div>
+
+      <div class="tb-group tb-transport">
+        <button id="btnRewind" class="btn-icon" title="Jump to start (Home)">|&lt;</button>
+        <button id="btnPlay" class="btn-play" title="Play / Stop (Space)">Play</button>
+        <button id="btnLoop" class="btn-toggle" title="Toggle loop (L)">Loop</button>
+        <button id="btnClick" class="btn-toggle" title="Metronome click (K)">Click</button>
+        <div id="posReadout" class="readout" title="Bar : Beat | Time">001:1.00 &middot; 0:00.0</div>
+        <div class="bpm-box">
+          <span class="lbl">BPM</span>
+          <input id="bpmInput" type="number" min="40" max="260" step="0.1" value="128" />
+          <button id="btnTapBpm" class="btn-mini" title="Tap project BPM">Tap</button>
+        </div>
+        <select id="bpbSelect" title="Beats per bar">
+          <option value="4" selected>4/4</option>
+          <option value="3">3/4</option>
+          <option value="6">6/8</option>
+          <option value="5">5/4</option>
+          <option value="7">7/8</option>
+        </select>
+      </div>
+
+      <div class="tb-group tb-tools">
+        <div class="vol-box" title="Master monitoring volume">
+          <span class="lbl">Vol</span>
+          <input id="volSlider" type="range" min="0" max="1.5" step="0.02" value="1" />
+        </div>
+        <button id="btnAudioOut" class="btn-ghost" title="Audio output device">Audio</button>
+        <button id="btnExport" class="btn-accent" title="Export mastered WAV or MP3">Export</button>
+      </div>
+    </header>
+
+    <!-- Main Body -->
+    <div id="workspace">
+      <!-- Left Library Sidebar -->
+      <aside id="sidebar">
+        <div class="sb-head">
+          <span class="sb-title">LIBRARY</span>
+          <span id="libCount" class="sb-count">0</span>
+          <button id="btnImportSong" class="btn-accent btn-sm" title="Import new audio file into shared library">+ Import</button>
+          <input id="importFileInput" type="file" accept="audio/*,.wav,.flac,.mp3,.m4a,.ogg,.opus" hidden />
+        </div>
+        <div class="sb-controls">
+          <input id="libSearch" type="search" placeholder="Search title, artist, genre, key, BPM..." />
+          <div class="sb-row">
+            <select id="libGroup" title="Organize library by">
+              <option value="folders" selected>Folders</option>
+              <option value="artist">Artists</option>
+              <option value="genre">Genres</option>
+              <option value="key">Key</option>
+              <option value="tempo">Tempo</option>
+              <option value="flat">All (Flat)</option>
+            </select>
+            <select id="libSort" title="Sort songs">
+              <option value="recent">Recent</option>
+              <option value="title">Title</option>
+              <option value="bpm">BPM</option>
+              <option value="key">Key</option>
+            </select>
+            <button id="btnCompatFilter" class="btn-toggle btn-sm" title="Filter to songs harmonically & tempo compatible with mix">Match</button>
+          </div>
+          <div id="libFolderBar" class="sb-row sb-fbar">
+            <button id="btnNewFolder" class="btn-mini btn-ghost" title="Create a new library folder">+ Folder</button>
+            <button id="btnToggleAllFolders" class="btn-mini btn-ghost" title="Expand or collapse all folders">Expand All</button>
+            <button id="btnSyncFolders" class="btn-mini btn-ghost" title="Sync folders read-only from Re-Tex (full)">Sync Re-Tex</button>
+          </div>
+        </div>
+        <div id="libList" class="sb-list"></div>
+      </aside>
+
+      <!-- Right Arrangement Area -->
+      <main id="arrangement">
+        <!-- Arrangement Edit Toolbar -->
+        <section id="editBar">
+          <div class="eb-group">
+            <div class="snap-box">
+              <span class="lbl">Snap</span>
+              <select id="snapSelect" title="Grid snap resolution (hold Alt to bypass)">
+                <option value="4">Bar</option>
+                <option value="1" selected>Beat</option>
+                <option value="0.5">1/2</option>
+                <option value="0.25">1/4</option>
+                <option value="0.125">1/8</option>
+                <option value="0">Off</option>
+              </select>
+            </div>
+            <span class="eb-sep"></span>
+            <button id="btnSplit" class="btn-ghost btn-sm" title="Split selected clip(s) at playhead (S)">Split (S)</button>
+            <button id="btnDupAfter" class="btn-ghost btn-sm" title="Duplicate selected clip(s) right after selection (Ctrl+D)">Dup After (Ctrl+D)</button>
+            <button id="btnAlignBar" class="btn-ghost btn-sm" title="Align clip downbeat to nearest bar 1 (A)">Align Bar 1 (A)</button>
+          </div>
+          <div class="eb-group">
+            <span class="hit-badge ok" style="font-size:10px;cursor:default" title="Runs 100% in your browser via Web Audio — no server needed">LIVE BROWSER DEMO</span>
+            <button id="btnResetDemo" class="btn-ghost btn-sm" title="Reset demo project & folders to defaults">Reset Demo</button>
+            <a href="https://github.com/Texmexdex/re-tex-core" target="_blank" rel="noopener" class="btn-ghost btn-sm" style="text-decoration:none;color:var(--text);border:1px solid var(--border);border-radius:5px">GitHub Repo</a>
+            <span class="eb-sep"></span>
+            <button id="btnUndo" class="btn-ghost btn-sm" title="Undo (Ctrl+Z)">Undo</button>
+            <button id="btnRedo" class="btn-ghost btn-sm" title="Redo (Ctrl+Y)">Redo</button>
+          </div>
+        </section>
+
+        <!-- Songs in Current Mix Strip (Quantize / Hit Audit / Song Key / Mult) -->
+        <section id="songsBar">
+          <div class="songs-bar-label">SONGS IN MIX</div>
+          <div id="songsStrip" class="songs-strip">
+            <div class="songs-empty">Drag stems or click +All in the library to start building a mashup.</div>
+          </div>
+        </section>
+
+        <!-- Timeline Split: Track Headers + Canvas -->
+        <section id="timelineWrap">
+          <div id="trackHeaders">
+            <div class="th-ruler-corner">
+              <span>LANES</span>
+              <button id="btnAddLane" class="btn-mini" title="Add track lane">+ Lane</button>
+            </div>
+            <div id="trackHeaderList"></div>
+          </div>
+          <div id="timelineViewport">
+            <canvas id="timelineCanvas"></canvas>
+            <div id="zoomControls">
+              <button id="btnZoomOut" class="btn-mini" title="Zoom out (-)">-</button>
+              <button id="btnZoomFit" class="btn-mini" title="Fit arrangement">Fit</button>
+              <button id="btnZoomIn" class="btn-mini" title="Zoom in (+)">+</button>
+            </div>
+          </div>
+        </section>
+
+        <!-- Bottom Clip Inspector & Status Bar -->
+        <footer id="inspector">
+          <div id="clipInspector" class="insp-left">
+            <span class="insp-muted">Click a clip to inspect &middot; Drag edges to trim &middot; Drag top corners to fade &middot; S = Split &middot; Ctrl+D = Duplicate After &middot; A = Align Bar 1</span>
+          </div>
+          <div id="statusArea" class="insp-right">
+            <button id="taskPill" class="task-pill" title="Click to inspect active tasks, progress & browser audio cache">
+              <span id="taskDot" class="task-dot"></span>
+              <span id="taskLabel">Ready</span>
+              <div id="taskBar" class="job-bar hidden"><div id="taskFill"></div></div>
+              <span id="taskTimer" class="task-timer hidden"></span>
+            </button>
+            <span id="cacheTag" class="cache-tag" title="Browser audio RAM cache (auto-freed when lanes/clips are removed)">0 MB</span>
+          </div>
+        </footer>
+      </main>
+    </div>
+  </div>
+
+  <!-- Activity & Progress Tracker Drawer -->
+  <div id="taskDrawer" class="task-drawer hidden">
+    <div class="td-head">
+      <span>PROCESSING &amp; AUDIO CACHE</span>
+      <div class="td-head-btns">
+        <button id="btnCancelWarps" class="btn-mini btn-ghost hidden" title="Cancel queued background R3 warps">Cancel Warps</button>
+        <button id="btnPruneCache" class="btn-mini btn-ghost" title="Drop any unused buffers from browser RAM">Free Unused</button>
+        <button id="btnCloseDrawer" class="btn-mini btn-ghost">x</button>
+      </div>
+    </div>
+    <div id="tdBody" class="td-body"></div>
+  </div>
+
+  <!-- Context Menu -->
+  <div id="ctxMenu" class="ctx-menu hidden"></div>
+
+  <!-- Beat Grid & Transient Audit Modal -->
+  <div id="gridModal" class="modal hidden">
+    <div class="modal-card modal-wide">
+      <div class="modal-head">
+        <div>
+          <h3 id="gmTitle">Beat Grid &amp; Hit Audit</h3>
+          <div id="gmSubtitle" class="modal-sub"></div>
+        </div>
+        <button id="gmClose" class="btn-ghost">Close</button>
+      </div>
+      <div id="gmAuditBanner" class="audit-banner"></div>
+      <div class="gm-canvas-wrap">
+        <canvas id="gmCanvas"></canvas>
+      </div>
+      <div class="gm-controls">
+        <div class="gm-group">
+          <button id="gmPlayRaw" class="btn-ghost">Play Raw + Click</button>
+          <button id="gmPlayQuant" class="btn-ghost">Play Quantized + Click</button>
+          <button id="gmStopAud" class="btn-ghost">Stop</button>
+        </div>
+        <div class="gm-group">
+          <button id="gmAutoFix" class="btn-ghost" title="Re-detect beats against full-band kick+snare transients">Auto-Fix Hits</button>
+          <button id="gmQuantize" class="btn-accent" title="Warp all 4 stems onto steady grid with R3 + click-pilot and verify">Quantize Stems</button>
+        </div>
+      </div>
+      <div class="gm-controls gm-adjust">
+        <div class="gm-group">
+          <span class="lbl">Bar 1 Phase</span>
+          <button id="gmShiftBack" class="btn-mini">&lt; -1 Beat</button>
+          <button id="gmShiftFwd" class="btn-mini">+1 Beat &gt;</button>
+        </div>
+        <div class="gm-group">
+          <span class="lbl">Nudge Phase</span>
+          <button id="gmNudgeM10" class="btn-mini">-10 ms</button>
+          <button id="gmNudgeM2" class="btn-mini">-2 ms</button>
+          <button id="gmNudgeP2" class="btn-mini">+2 ms</button>
+          <button id="gmNudgeP10" class="btn-mini">+10 ms</button>
+        </div>
+        <div class="gm-group">
+          <span class="lbl">Tempo Count</span>
+          <button id="gmHalf" class="btn-mini">0.5x</button>
+          <button id="gmDouble" class="btn-mini">2x</button>
+        </div>
+      </div>
+      <div class="gm-table-wrap">
+        <table class="gm-table">
+          <thead>
+            <tr><th>Window</th><th>Local BPM</th><th>Active</th><th>Offset vs Drum Hits</th><th>Clarity</th></tr>
+          </thead>
+          <tbody id="gmSectionsBody"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- Export Modal -->
+  <div id="exportModal" class="modal hidden">
+    <div class="modal-card modal-sm">
+      <div class="modal-head">
+        <h3>Export Mix</h3>
+        <button id="expClose" class="btn-ghost">Close</button>
+      </div>
+      <div class="modal-body">
+        <label class="field">
+          <span>Format</span>
+          <select id="expFormat">
+            <option value="wav" selected>WAV (16-bit Browser Bounce)</option>
+          </select>
+        </label>
+        <label class="field field-row">
+          <input id="expNorm" type="checkbox" checked />
+          <span>Normalize to -12 LUFS (brickwall -1 dBFS)</span>
+        </label>
+        <div id="expResult" class="exp-result hidden"></div>
+      </div>
+      <div class="modal-foot">
+        <button id="expReveal" class="btn-ghost">Open Exports Folder</button>
+        <button id="expRun" class="btn-accent">Bounce &amp; Export</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Audio Device Modal -->
+  <div id="audioModal" class="modal hidden">
+    <div class="modal-card modal-sm">
+      <div class="modal-head">
+        <h3>Audio Output</h3>
+        <button id="audClose" class="btn-ghost">Close</button>
+      </div>
+      <div class="modal-body">
+        <label class="field">
+          <span>Output Device</span>
+          <select id="audDeviceSelect"></select>
+        </label>
+      </div>
+      <div class="modal-foot">
+        <button id="audApply" class="btn-accent">Apply</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Toast stack -->
+  <div id="toasts"></div>
+
+  <script src="./js/demo-backend.js"></script>
+  <script type="module" src="./js/main.js"></script>
+</body>
+</html>

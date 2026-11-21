@@ -3,10 +3,18 @@
 A lean, responsive multi-stem mashup DAW focused on the essentials that matter most: **transient-verified beat alignment, 1-click quantization, per-stem & per-clip key shifting, fast clip editing, zero-lag browser playback, and studio `-12 LUFS` export**.
 
 <p align="center">
-  <img src="docs/walkthrough.gif" alt="Re-Tex Core 7-Step Interactive Walkthrough" width="960" />
+  <a href="https://texmexdex.github.io/re-tex-core/">
+    <img src="docs/walkthrough.gif" alt="Re-Tex Core 7-Step Interactive Walkthrough" width="960" />
+  </a>
 </p>
 
-> **Listen to a 30-second royalty-free demo bounce rendered directly by Re-Tex Core:** [`docs/demo_mashup.mp3`](docs/demo_mashup.mp3) *(124→127.5 BPM drifting synthwave track auto-audited & quantized to `0.0 ms`, mashed seamlessly onto a steady 128 BPM house groove, mastered to `-12.0 LUFS`)*
+<p align="center">
+  <strong><a href="https://texmexdex.github.io/re-tex-core/">▶ Launch Live Interactive Browser Demo (GitHub Pages — No Install Needed)</a></strong>
+  &nbsp;&middot;&nbsp;
+  <a href="docs/demo_mashup.mp3">Listen to 30s Demo Bounce (MP3)</a>
+</p>
+
+> **Live Browser Demo (`docs/`):** Runs 100% client-side in Web Audio using a static faux backend (`docs/js/demo-backend.js`) with 2 pre-baked royalty-free 4-stem tracks — press **Space** to play live, toggle **Quantize** to compare raw drifting vs. `0.0 ms` quantized drums, test **Split (`S`)**, **Duplicate After (`Ctrl+D`)**, real-time **Per-Stem Pitch (`AudioWorklet`)**, **Beat Grid & Hit Audit**, and real **in-browser WAV Export**!
 
 ---
 

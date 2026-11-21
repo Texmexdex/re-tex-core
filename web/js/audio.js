@@ -4,12 +4,90 @@
 // - Seamless background hot-swap: plays instant preview while backend R3 warps, swaps R3 buffer in live!
 // - Sample-accurate Web Audio Metronome Click & Grid Modal Audition with Click
 
-import { S, emit, songGrid, songMeta, songMult, songUseQuantized } from "./state.js";
+import { S, clipTotalSemis, emit, songGrid, songMeta, songMult, songUseQuantized } from "./state.js";
 
 let ctx = null;
 let masterBus = null;
 let masterComp = null;
 let masterGain = null;
+let pitchWorkletReady = false;
+let pitchWorkletLoading = false;
+
+const PITCH_WORKLET_CODE = `
+class RetexPitchProcessor extends AudioWorkletProcessor {
+  static get parameterDescriptors() {
+    return [{ name: "semis", defaultValue: 0, minValue: -12, maxValue: 12, automationRate: "k-rate" }];
+  }
+  constructor() {
+    super();
+    this.size = 4096;
+    this.mask = 4095;
+    this.grain = 2048;
+    this.buf = [new Float32Array(4096), new Float32Array(4096)];
+    this.wp = 0;
+    this.ph = 0;
+  }
+  process(inputs, outputs, params) {
+    const inp = inputs[0], out = outputs[0];
+    if (!inp || !inp.length || !out || !out.length) return true;
+    const semis = params.semis[0];
+    const n = out[0].length;
+    const chs = Math.min(2, out.length);
+    if (Math.abs(semis) < 0.01) {
+      for (let c = 0; c < chs; c++) out[c].set(inp[Math.min(c, inp.length - 1)]);
+      return true;
+    }
+    const ratio = Math.pow(2, semis / 12);
+    const step = (1 - ratio) / this.grain;
+    const mask = this.mask, grain = this.grain;
+    for (let i = 0; i < n; i++) {
+      const wp = this.wp;
+      for (let c = 0; c < chs; c++) {
+        this.buf[c][wp] = inp[Math.min(c, inp.length - 1)][i];
+      }
+      let p1 = this.ph;
+      let p2 = p1 + 0.5;
+      if (p2 >= 1) p2 -= 1;
+      const d1 = p1 * grain, d2 = p2 * grain;
+      const w1 = 0.5 * (1 - Math.cos(2 * Math.PI * p1));
+      const w2 = 1 - w1;
+      const r1 = wp - d1, r2 = wp - d2;
+      const i1 = Math.floor(r1), f1 = r1 - i1;
+      const i2 = Math.floor(r2), f2 = r2 - i2;
+      const a1 = i1 & mask, b1 = (i1 + 1) & mask;
+      const a2 = i2 & mask, b2 = (i2 + 1) & mask;
+      for (let c = 0; c < chs; c++) {
+        const b = this.buf[c];
+        const s1 = b[a1] * (1 - f1) + b[b1] * f1;
+        const s2 = b[a2] * (1 - f2) + b[b2] * f2;
+        out[c][i] = s1 * w1 + s2 * w2;
+      }
+      this.wp = (wp + 1) & mask;
+      let np = p1 + step;
+      if (np >= 1) np -= 1;
+      else if (np < 0) np += 1;
+      this.ph = np;
+    }
+    return true;
+  }
+}
+registerProcessor("retex-pitch", RetexPitchProcessor);
+`;
+
+function loadPitchWorklet(ac) {
+  if (!ac?.audioWorklet || pitchWorkletReady || pitchWorkletLoading) return;
+  pitchWorkletLoading = true;
+  try {
+    const url = URL.createObjectURL(new Blob([PITCH_WORKLET_CODE], { type: "application/javascript" }));
+    ac.audioWorklet.addModule(url).then(() => {
+      pitchWorkletReady = true;
+      URL.revokeObjectURL(url);
+      if (isPlaying) rescheduleLive();
+    }).catch(() => { pitchWorkletLoading = false; });
+  } catch {
+    pitchWorkletLoading = false;
+  }
+}
 
 // Reference-counted browser AudioBuffer cache
 // key -> { buffer: AudioBuffer, scale: number, t0: number, bytes: number }
@@ -63,6 +141,7 @@ function ensureContext() {
     masterComp.connect(masterGain);
     masterGain.connect(ctx.destination);
     buildClickBuffers();
+    loadPitchWorklet(ctx);
   }
   if (ctx.state === "suspended") {
     ctx.resume().catch(() => {});
@@ -519,7 +598,19 @@ function scheduleClipsFrom(startBeat) {
       cg.gain.linearRampToValueAtTime(0.0001, endTime);
     }
 
-    src.connect(cg);
+    const totalSemis = clipTotalSemis(c);
+    if (!warpEntry && pitchWorkletReady && Math.abs(totalSemis) > 0.01) {
+      try {
+        const pn = new AudioWorkletNode(ac, "retex-pitch", { numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [2] });
+        pn.parameters.get("semis").setValueAtTime(Math.max(-12, Math.min(12, totalSemis)), when);
+        src.connect(pn);
+        pn.connect(cg);
+      } catch {
+        src.connect(cg);
+      }
+    } else {
+      src.connect(cg);
+    }
     cg.connect(tNode.input);
     src.start(when, offsetSec);
     src.stop(endTime + 0.002);
@@ -786,3 +877,110 @@ export async function setAudioOutput(deviceId) {
   }
   return false;
 }
+
+// ------------------------------------------------------------------ Browser Offline WAV Export (for GitHub Pages Demo)
+
+function encodeWav16(audioBuf) {
+  const nCh = Math.min(2, audioBuf.numberOfChannels);
+  const n = audioBuf.length;
+  const sr = audioBuf.sampleRate;
+  const dataBytes = n * nCh * 2;
+  const ab = new ArrayBuffer(44 + dataBytes);
+  const dv = new DataView(ab);
+  const wrStr = (off, s) => { for (let i = 0; i < s.length; i++) dv.setUint8(off + i, s.charCodeAt(i)); };
+  wrStr(0, "RIFF");
+  dv.setUint32(4, 36 + dataBytes, true);
+  wrStr(8, "WAVE");
+  wrStr(12, "fmt ");
+  dv.setUint32(16, 16, true);
+  dv.setUint16(20, 1, true);
+  dv.setUint16(22, nCh, true);
+  dv.setUint32(24, sr, true);
+  dv.setUint32(28, sr * nCh * 2, true);
+  dv.setUint16(32, nCh * 2, true);
+  dv.setUint16(34, 16, true);
+  wrStr(36, "data");
+  dv.setUint32(40, dataBytes, true);
+  const chs = Array.from({ length: nCh }, (_, c) => audioBuf.getChannelData(c));
+  let pos = 44;
+  let peak = 0;
+  for (let i = 0; i < n; i++) {
+    for (let c = 0; c < nCh; c++) {
+      const v = Math.max(-1, Math.min(1, chs[c][i]));
+      if (Math.abs(v) > peak) peak = Math.abs(v);
+      dv.setInt16(pos, v < 0 ? v * 32768 : v * 32767, true);
+      pos += 2;
+    }
+  }
+  return { blob: new Blob([ab], { type: "audio/wav" }), peakDb: 20 * Math.log10(Math.max(1e-6, peak)) };
+}
+
+export async function renderOfflineWav(project) {
+  const bpm = Number(project?.bpm || 128);
+  const secPerBeat = 60.0 / bpm;
+  const endBeat = Math.max(0, ...(project?.clips || []).filter((c) => !c.mute).map((c) => c.start + c.len));
+  if (endBeat <= 0.1) throw new Error("No audible clips to export");
+  const totalSec = endBeat * secPerBeat + 0.12;
+  const sr = 44100;
+  const off = new OfflineAudioContext(2, Math.ceil(totalSec * sr), sr);
+
+  const mBus = off.createGain();
+  const comp = off.createDynamicsCompressor();
+  comp.threshold.value = -12;
+  comp.ratio.value = 3.0;
+  mBus.connect(comp);
+  comp.connect(off.destination);
+
+  const anySolo = (project.tracks || []).some((t) => t.solo);
+  const tMap = new Map();
+  for (const t of project.tracks || []) {
+    const inp = off.createGain();
+    const hpf = off.createBiquadFilter(); hpf.type = "highpass"; hpf.frequency.value = Number(t.hpf || 0) > 20 ? Number(t.hpf) : 10;
+    const lpf = off.createBiquadFilter(); lpf.type = "lowpass"; lpf.frequency.value = Number(t.lpf || 0) > 200 ? Number(t.lpf) : 22000;
+    const pan = off.createStereoPanner(); pan.pan.value = Math.max(-1, Math.min(1, Number(t.pan || 0)));
+    const gn = off.createGain();
+    const audible = !t.mute && (t.solo || !anySolo);
+    gn.gain.value = audible ? Math.pow(10, Number(t.gain_db || 0) / 20) : 0;
+    inp.connect(hpf); hpf.connect(lpf); lpf.connect(pan); pan.connect(gn); gn.connect(mBus);
+    tMap.set(t.id, inp);
+  }
+
+  for (const c of project.clips || []) {
+    if (c.mute || Number(c.len || 0) <= 0) continue;
+    const dest = tMap.get(c.track);
+    if (!dest) continue;
+    const ent = cache.get(sourceCacheKeyForClip(c));
+    if (!ent) continue;
+    const g = songGrid(c.song);
+    if (!g) continue;
+    const useQ = songUseQuantized(c.song);
+    const pSrc = useQ && g.quantized?.period ? Number(g.quantized.period) : 60.0 / Number(g.bpm || 120);
+    const t0Src = useQ && g.quantized ? Number(g.quantized.t0) : Number(g.beats?.[0] || 0);
+    const mult = songMult(c.song);
+    const rate = Number(c.rate || 1.0);
+    const pbRate = Math.max(0.25, Math.min(4.0, (pSrc / (secPerBeat * mult)) * rate));
+    const when = Math.max(0, c.start * secPerBeat);
+    const durWall = c.len * secPerBeat;
+    const offSec = Math.max(0, t0Src + Number(c.src) * pSrc);
+    const s = off.createBufferSource();
+    s.buffer = ent.buffer;
+    s.playbackRate.value = pbRate;
+    const cg = off.createGain();
+    const baseG = Math.pow(10, Number(c.gain_db || 0) / 20) * (ent.scale > 1e-5 ? 1 / ent.scale : 1);
+    const fi = Math.max(0.004, Number(c.fade_in || 0) * secPerBeat);
+    const fo = Math.max(0.004, Number(c.fade_out || 0.04) * secPerBeat);
+    cg.gain.setValueAtTime(0.0001, when);
+    cg.gain.linearRampToValueAtTime(baseG, Math.min(when + durWall, when + fi));
+    cg.gain.setValueAtTime(baseG, Math.max(when + fi, when + durWall - fo));
+    cg.gain.linearRampToValueAtTime(0.0001, when + durWall);
+    s.connect(cg); cg.connect(dest);
+    s.start(when, offSec);
+    s.stop(when + durWall + 0.002);
+  }
+
+  const rendered = await off.startRendering();
+  const { blob, peakDb } = encodeWav16(rendered);
+  return { blob, seconds: Math.round(totalSec * 100) / 100, peakDb: Math.round(peakDb * 100) / 100 };
+}
+
+window.__retexRenderOfflineWav = renderOfflineWav;

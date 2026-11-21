@@ -14,11 +14,12 @@ dist/
 build/
 .pytest_cache/
 
-# Raw audio & OS files (keep small royalty-free README demo clip)
+# Raw audio & OS files (keep small royalty-free README & GitHub Pages demo audio)
 *.wav
 *.flac
 *.mp3
 !docs/demo_mashup.mp3
+!docs/demo_assets/audio/*.mp3
 *.m4a
 *.ogg
 *.npy
