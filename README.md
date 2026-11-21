@@ -1,66 +1,99 @@
 # Re-Tex Core
 
-A lean, responsive multi-stem mashup DAW focused on the essentials that matter most: **rock-solid beat alignment, 1-click quantization, per-stem & per-clip key shifting, fast clip editing, and studio `-12 LUFS` export**.
+A lean, responsive multi-stem mashup DAW focused on the essentials that matter most: **transient-verified beat alignment, 1-click quantization, per-stem & per-clip key shifting, fast clip editing, zero-lag browser playback, and studio `-12 LUFS` export**.
 
-## Key Features
-- **Transient-Verified Viterbi Beat Engine (`retex_core/grid.py`)**
-  - Uses zero-phase full-band kick (`30–160 Hz`) + snare (`250–3500 Hz`) onsets (`filtfilt`) with a continuity-constrained **Viterbi dynamic-programming phase tracker** and syncopation-aware auditing.
-  - Catches detector drift, glitch sub-beats, and off-beat grids loudly — green beat markers and sync ribbons on the timeline *always* reflect verified real drum transients.
-- **1-Click Rubber Band R3 + Click-Pilot Quantization (`retex_core/quantize.py`)**
-  - Locks drifting songs onto a dead-steady beat grid with sub-millisecond click-pilot correction, then re-audits the rendered quantized drums to prove alignment.
-- **Zero-Lag Browser Web Audio Playback (`web/js/audio.js`)**
-  - Play, Stop, Seek, Mute, Solo, Gain, Pan, HPF, LPF, Metronome Click, and Grid Modal Audition run natively in Chrome's `AudioContext` (`< 1 ms` Stop even during heavy background warping).
-  - Background Rubber Band R3 warps run at below-normal priority and hot-swap seamlessly into live playback when finished; unused `AudioBuffer`s auto-evict from browser RAM when clips/lanes/projects change.
-- **Per-Song, Per-Stem & Per-Clip Pitch Control**
-  - Transpose a whole song (pitched stems only, drums untouched), shift individual stem lanes (`KEY - 0st +`), or override any clip (`Alt + Scroll` or Clip Inspector).
-- **Essential DAW Editing & Library Organization**
-  - Split (`S`), Trim edges, Fade handles, Copy/Paste (`Ctrl+C`/`Ctrl+V`), Duplicate After (`Ctrl+D`), Align Bar 1 (`A`), 150-step Undo/Redo, collapsible Folders + Group-By (`Folders / Artists / Genres / Key / Tempo / Flat`), Camelot+BPM `Match` filter, always-visible zoomed-out sync ribbons, and live Progress Tracker + Activity Drawer.
-- **Dual Mode: Shared or Portable Standalone**
-  - Automatically shares an existing Re-Tex library (`F:\mashup_lab\data\songs`) when present (read-only for existing songs), or runs **100% standalone** inside `./data/` on a laptop or fresh GitHub clone.
-  - Includes a clean **2-Stage Standalone Stem Separator (`retex_core/separate.py`)** using **Mel-Band Roformer** (Stage 1 full-band vocals + exact complement instrumental) followed by **vocal-free instrumental splitting** (Stage 2 drums/bass + exact complement `other`) to avoid frequency loss, volume sinks, and vocals leaking into `other`.
+<p align="center">
+  <img src="docs/walkthrough.gif" alt="Re-Tex Core 7-Step Interactive Walkthrough" width="960" />
+</p>
+
+> **Listen to a 30-second royalty-free demo bounce rendered directly by Re-Tex Core:** [`docs/demo_mashup.mp3`](docs/demo_mashup.mp3) *(124→127.5 BPM drifting synthwave track auto-audited & quantized to `0.0 ms`, mashed seamlessly onto a steady 128 BPM house groove, mastered to `-12.0 LUFS`)*
 
 ---
 
-## Quick Start (Standalone / Laptop)
+## Try the Built-In Interactive Demo (Zero Downloads Needed!)
+
+Want to see everything Re-Tex Core can do in **3 seconds** on a fresh install — without importing any songs or downloading AI weights?
+
+```bash
+python -m retex_core --demo
+```
+*(Or double-click **`Run Demo.bat`** on Windows.)*
+
+Demo Mode runs in an isolated `./data_demo/` folder (never touching your main library) and synthesizes two royalty-free 4-stem tracks plus a ready-to-play mashup:
+1. **`Midnight Drift (Demo)`** — 124→127.5 BPM (`A minor / 8A`) with an intentional **+95 ms off-beat initial beat map + live tempo drift** so you can inspect Re-Tex Core's Viterbi mistake catcher flagging the error and locking it to **`0.0 ms`** via 1-click **Quantize**.
+2. **`Neon Pulse (Demo)`** — steady 128 BPM (`C major / 8B`, Camelot-compatible with `8A`).
+3. **`Demo Mashup (Midnight Drift x Neon Pulse)`** — pre-arranged at `128 BPM` so you can immediately press **Space**, test **Split (`S`)**, **Duplicate After (`Ctrl+D`)**, per-stem **Key** shifting, **Beat Grid & Hit Audit**, and **Export**.
+
+---
+
+## Step-by-Step Workflow (Matches the GIF Above)
+
+1. **Organize Folders & Add Stems** — Browse collapsible folders (or group by **Artists / Genres / Key / Tempo / Flat**), toggle **Match** to filter by Camelot key & tempo compatibility, click **`+All`** to drop all 4 stems aligned to Bar 1, or drag individual **`D / B / O / V`** chips onto any lane.
+2. **Catch Off-Beat Grids & Quantize to `0.0 ms`** — Click **Grid** (or the colored sync badge) in **SONGS IN MIX** to inspect full-band zero-phase drum transients (`30–160 Hz` kick + `250–3500 Hz` snare). Click **Quantize** to warp all 4 stems onto a dead-steady beat grid with Rubber Band R3 + click-pilot correction, then verify every section hits `0.0 ms`.
+   <p align="center"><img src="docs/grid_audit.png" alt="Beat Grid & Drum-Hit Audit Modal" width="840" /></p>
+3. **Inspect Clips & Position Playhead** — Click any clip for numeric **Start, Len, Clip Pitch, Gain, Fade In/Out, and Rate (`0.5×/1×/2×`)** controls. Drag clip edges to trim and top-corner dots to fade.
+4. **Split (`S`) & Duplicate After (`Ctrl+D`)** — Slice clips cleanly at the playhead and chain duplicates immediately after while preserving relative lane timing and green Bar-1 sync (`A` aligns Bar 1 to the nearest project bar).
+5. **Shift Key Per-Song, Per-Stem, or Per-Clip** — Transpose a full song in **SONGS IN MIX** (drums stay unpitched), shift individual stems directly on each lane header (`KEY - 0st +`), or override a single clip (`Alt + Scroll` or Clip Inspector).
+6. **Zero-Lag Browser Web Audio Playback & Progress Tracker** — Play, Stop, Seek, Mute, Solo, Gain, Pan, HPF, LPF, and Metronome Click run natively in Chrome's Web Audio `AudioContext` (`< 1 ms` Stop even while Rubber Band R3 warps in the background). Click the bottom-right **Progress Tracker pill** to view live task timers, cancel queued warps, or monitor the auto-evicting browser RAM cache.
+7. **Master & Export** — Bounce bit-exact **24-bit WAV** or **320 kbps MP3** via 2-pass **`-12 LUFS`** loudness normalization with a `-1 dBFS` brickwall limiter.
+
+---
+
+## Quick Install (Standalone / Portable Laptop)
 
 ### Prerequisites
 - **Python 3.11 – 3.13**
-- **`ffmpeg`** on `PATH` (for MP3 export & compressed audio decoding; on Windows: `winget install Gyan.FFmpeg`)
+- **`ffmpeg`** on `PATH` (for MP3 export & compressed audio decoding — Windows: `winget install Gyan.FFmpeg`)
 
 ### Windows
-1. Clone this repository.
-2. Double-click **`install.bat`** (creates `.venv`, installs lightweight Core DAW packages, and optionally installs `audio-separator` + PyTorch CUDA/CPU for standalone `+ Import` stem separation).
-3. Double-click **`Run Re-Tex Core.bat`** -> opens `http://127.0.0.1:8770`.
+```powershell
+git clone https://github.com/Texmexdex/re-tex-core.git
+cd re-tex-core
+.\install.bat
+```
+Then double-click **`Run Re-Tex Core.bat`** (or **`Run Demo.bat`**) — opens `http://127.0.0.1:8770`.
 
 ### macOS / Linux
 ```bash
-chmod +x install.sh
-./install.sh
-.venv/bin/python -m retex_core
+git clone https://github.com/Texmexdex/re-tex-core.git
+cd re-tex-core
+chmod +x install.sh && ./install.sh
+.venv/bin/python -m retex_core --demo
 ```
 
 ---
 
+## Standalone 2-Stage Clean Stem Separation (`retex_core/separate.py`)
+
+When running in Standalone Mode (or with `RETEX_CORE_SEP=v2`) and optional `audio-separator` installed via `install.bat`, importing a new song uses a clean **2-Stage Cascade** designed to eliminate frequency loss, `-6 dB` vocal volume sinks, and vocals leaking into `other`:
+1. **Stage 1 (Full-Band Vocals):** **Mel-Band Roformer** (`vocals_mel_band_roformer.ckpt`) extracts vocals cleanly, computing the exact residual instrumental (`inst = mix - vocals`).
+2. **Stage 2 (Vocal-Free Instrumental Split):** Splits only the vocal-free instrumental into `drums` and `bass`, computing `other = inst - drums - bass` as an exact complement (`drums + bass + other + vocals == original mix` with zero Wiener-mask pumping).
+
+---
+
 ## Environment Flags (Optional)
+
 | Variable | Default | Purpose |
 |---|---|---|
-| `RETEX_CORE_STANDALONE` | `0` (auto) | Set to `1` to force standalone `./data/songs` library even if `F:\mashup_lab` exists |
-| `RETEX_CORE_SEP` | `auto` | `v2` = 2-stage Mel-Band Roformer + vocal-free split · `fast` = single-pass HTDemucs · `retex` = delegate to Re-Tex |
+| `RETEX_CORE_STANDALONE` | `0` (auto) | Set to `1` to force standalone `./data/songs` library even if Re-Tex (`F:\mashup_lab`) is present |
+| `RETEX_CORE_SEP` | `auto` | `v2` = 2-stage Mel-Band Roformer · `fast` = single-pass HTDemucs · `retex` = delegate to Re-Tex |
 | `RETEX_CORE_PORT` | `8770` | Local HTTP port |
-| `RETEX_CORE_DATA` | `./data` | Override data/projects/cache/exports folder |
+| `RETEX_CORE_DATA` | `./data` | Override projects/grids/cache/exports folder |
 
 ---
 
 ## Keyboard Shortcuts
-- `Space` — Play / Stop (`< 1 ms` Web Audio)
-- `Home` — Jump to start
-- `S` — Split clip(s) at playhead
-- `Ctrl+D` — Duplicate After (preserves relative timing & lanes)
-- `A` — Align Bar 1 to nearest project bar
-- `M` — Mute / Unmute selected clip(s)
-- `L` — Toggle Loop (`Shift + Drag` ruler to draw loop range)
-- `K` — Toggle sample-locked Metronome Click
-- `Ctrl+C` / `Ctrl+V` — Copy / Paste
-- `Ctrl+Z` / `Ctrl+Y` — Undo / Redo (150 steps)
-- `Ctrl+S` — Save project
-- `Alt + Scroll` over clip — Fine clip pitch (`±1 st`) · `Ctrl + Scroll` — Zoom · `Shift + Scroll` — Pan
+
+| Key | Action |
+|---|---|
+| `Space` | Play / Stop (`< 1 ms` native Web Audio) |
+| `Home` | Jump playhead to Bar 1 |
+| `S` | Split selected clip(s) at playhead |
+| `Ctrl+D` | Duplicate After (chains selection preserving offsets & lanes) |
+| `A` | Align Bar 1 to nearest project bar |
+| `M` | Mute / Unmute selected clip(s) |
+| `L` / `K` | Toggle Loop (`Shift+Drag` ruler to set range) / Metronome Click |
+| `Ctrl+C` / `Ctrl+V` | Copy / Paste clips |
+| `Ctrl+Z` / `Ctrl+Y` | 150-step Undo / Redo |
+| `Ctrl+S` | Save project |
+| `Alt + Scroll` | Nudge clip pitch (`±1 st`) · `Ctrl + Scroll` Zoom · `Shift + Scroll` Pan |

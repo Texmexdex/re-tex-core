@@ -1,5 +1,6 @@
 # Local runtime data, audio libraries, caches, projects, and AI model weights
 data/
+data_demo/
 models/
 .venv/
 venv/
@@ -13,10 +14,11 @@ dist/
 build/
 .pytest_cache/
 
-# Raw audio & OS files
+# Raw audio & OS files (keep small royalty-free README demo clip)
 *.wav
 *.flac
 *.mp3
+!docs/demo_mashup.mp3
 *.m4a
 *.ogg
 *.npy
