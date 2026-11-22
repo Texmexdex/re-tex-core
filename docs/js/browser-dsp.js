@@ -1070,6 +1070,49 @@
     return { cand, activeMask, winCount: winCenters.length };
   }
 
+  function smoothDriftBeats(beats) {
+    // 4-pass strictly positive binomial [0.25, 0.5, 0.25] smoother: zero overshoot at break edges,
+    // <0.3 ms bias on quadratic tempo ramps, and eliminates beat-to-beat micro-jitter!
+    const n = beats.length;
+    if (n < 8) return [...beats];
+    let cur = [...beats];
+    for (let pass = 0; pass < 4; pass++) {
+      const nxt = [...cur];
+      for (let i = 1; i < n - 1; i++) {
+        nxt[i] = 0.25 * cur[i - 1] + 0.5 * cur[i] + 0.25 * cur[i + 1];
+      }
+      cur = nxt;
+    }
+    const pMed = medianDiff(beats);
+    const minGap = 0.6 * pMed;
+    for (let i = 1; i < n; i++) {
+      if (cur[i] < cur[i - 1] + minGap) cur[i] = cur[i - 1] + minGap;
+    }
+    return cur;
+  }
+
+  function fitIrlsStraight(beats, activeMask) {
+    const actJ = [], actT = [];
+    for (let j = 0; j < beats.length; j++) {
+      if (activeMask[j]) { actJ.push(j); actT.push(beats[j]); }
+    }
+    if (actJ.length < 8) return null;
+    let { slope, intercept } = linearFit(actJ, actT);
+    const res = actJ.map((j, idx) => Math.abs(actT[idx] - (intercept + slope * j)));
+    const thr = Math.max(0.018, percentileOf(res, 75) * 1.8);
+    const inJ = [], inT = [];
+    for (let k = 0; k < actJ.length; k++) {
+      if (res[k] <= thr) { inJ.push(actJ[k]); inT.push(actT[k]); }
+    }
+    if (inJ.length >= 8) ({ slope, intercept } = linearFit(inJ, inT));
+    const candStraight = Array.from({ length: beats.length }, (_, j) => intercept + slope * j);
+    const straightDev = percentileOf(
+      actJ.map((j, idx) => Math.abs(actT[idx] - candStraight[j]) * 1000),
+      85,
+    );
+    return { candStraight, straightDev };
+  }
+
   function detectAndBuildGrid(left, right, sid, title, opts = {}) {
     const n = Math.min(left.length, right.length);
     const mono = new Float32Array(n);
@@ -1080,69 +1123,82 @@
 
     const { body, bodySmooth, kick, fps } = onsetCurves500Hz(mono, SR);
     const { period: p0, env100, fps100 } = estimateGlobalPeriod(body, bodySmooth, fps, preferBpm);
-    const localPeriod = buildLocalPeriodCurve(body, bodySmooth, fps, p0, env100.length, fps100);
-    let seed = trackBeatsDP(env100, fps100, localPeriod, bodySmooth, fps);
-    if (seed.length < 8) {
-      seed = [];
-      for (let t = 0; t <= dur + 0.02; t += p0) seed.push(t);
-    }
-    seed = recountSlips(seed);
 
-    // Continuity-constrained Viterbi DP pass 1 (16-beat windows, step 4)
-    let pass = runViterbiPass(seed, body, bodySmooth, fps, 16, 4);
-    let candFollow = pass.cand;
-    let activeMask = pass.activeMask;
-    let audFollow = auditBeatsJS(candFollow, body, bodySmooth, fps);
-
-    // If any section still shows >22 ms offset (e.g. abrupt tempo change), run tighter 12-beat Viterbi pass 2!
-    if (pass.winCount >= 2 && (audFollow.bad_windows > 0 || audFollow.max_offset_ms > OFFBEAT_WARN_MS)) {
-      const pass2 = runViterbiPass(recountSlips(candFollow), body, bodySmooth, fps, 12, 4);
-      const aud2 = auditBeatsJS(pass2.cand, body, bodySmooth, fps);
-      if (aud2.bad_windows < audFollow.bad_windows
-        || (aud2.bad_windows === audFollow.bad_windows && aud2.max_offset_ms < audFollow.max_offset_ms - 2.0)) {
-        candFollow = pass2.cand;
-        activeMask = pass2.activeMask;
-        audFollow = aud2;
-      }
-    }
-
-    let fixed = candFollow;
-    let action = pass.winCount >= 2 ? "drift_tracked" : (pass.winCount === 1 ? "phase_shifted" : "verified");
-
-    if (pass.winCount >= 2 && candFollow.length >= 8) {
-      // Robust IRLS straight-line fit on active beats (exact port of grid.py)
-      const actJ = [], actT = [];
-      for (let j = 0; j < candFollow.length; j++) {
-        if (activeMask[j]) { actJ.push(j); actT.push(candFollow[j]); }
-      }
-      if (actJ.length >= 8) {
-        let { slope, intercept } = linearFit(actJ, actT);
-        const res = actJ.map((j, idx) => Math.abs(actT[idx] - (intercept + slope * j)));
-        const thr = Math.max(0.018, percentileOf(res, 75) * 1.8);
-        const inJ = [], inT = [];
-        for (let k = 0; k < actJ.length; k++) {
-          if (res[k] <= thr) { inJ.push(actJ[k]); inT.push(actT[k]); }
+    // 1) STEADY-FIRST CHECK: Test a dead-steady constant-BPM grid first so studio-recorded songs
+    //    NEVER get tricked into false beat-to-beat drift by intros, fills, or guitar hits!
+    let fixed = null;
+    let action = "verified";
+    {
+      const { bestBin } = phaseHistSharpness(bodySmooth, fps, 0, bodySmooth.length, p0, 256);
+      const t0Init = ((bestBin + 0.5) / 256) * p0;
+      const straightSeed = [];
+      for (let t = t0Init; t <= dur + 0.02; t += p0) straightSeed.push(t);
+      if (straightSeed.length >= 8) {
+        const pSt = runViterbiPass(straightSeed, body, bodySmooth, fps, 16, 4);
+        const fit0 = pSt.winCount >= 2 ? fitIrlsStraight(pSt.cand, pSt.activeMask) : null;
+        if (fit0) {
+          const aud0 = auditBeatsJS(fit0.candStraight, body, bodySmooth, fps);
+          if (
+            fit0.straightDev <= 14.0
+            && aud0.active_windows >= 2
+            && aud0.bad_windows === 0
+            && aud0.median_offset_ms <= 12.0
+            && aud0.max_offset_ms <= 24.0
+          ) {
+            fixed = fit0.candStraight;
+            action = "steady_locked";
+          }
         }
-        if (inJ.length >= 8) ({ slope, intercept } = linearFit(inJ, inT));
+      }
+    }
 
-        const candStraight = Array.from({ length: candFollow.length }, (_, j) => intercept + slope * j);
-        const straightDev = percentileOf(
-          actJ.map((j, idx) => Math.abs(actT[idx] - candStraight[j]) * 1000),
-          85,
-        );
-        const audStraight = auditBeatsJS(candStraight, body, bodySmooth, fps);
+    // 2) DRIFT-TRACKING PATH: Only if steady grid failed, run local-tempo DP + Viterbi tracking
+    if (!fixed) {
+      const localPeriod = buildLocalPeriodCurve(body, bodySmooth, fps, p0, env100.length, fps100);
+      let seed = trackBeatsDP(env100, fps100, localPeriod, bodySmooth, fps);
+      if (seed.length < 8) {
+        seed = [];
+        for (let t = 0; t <= dur + 0.02; t += p0) seed.push(t);
+      }
+      seed = recountSlips(seed);
 
-        if (
-          straightDev <= 14.0
-          && audStraight.median_offset_ms <= Math.max(10.0, audFollow.median_offset_ms + 4.0)
-          && audStraight.bad_windows <= audFollow.bad_windows
-        ) {
-          fixed = candStraight;
-          action = "steady_locked";
-        } else {
-          fixed = evenInactiveGaps(candFollow, activeMask);
-          fixed = gentleHitSnap(fixed, activeMask, body, fps, 0.012);
-          action = "drift_tracked";
+      let pass = runViterbiPass(seed, body, bodySmooth, fps, 16, 4);
+      let candFollow = pass.cand;
+      let activeMask = pass.activeMask;
+      let audFollow = auditBeatsJS(candFollow, body, bodySmooth, fps);
+
+      if (pass.winCount >= 2 && (audFollow.bad_windows > 0 || audFollow.max_offset_ms > OFFBEAT_WARN_MS)) {
+        const pass2 = runViterbiPass(recountSlips(candFollow), body, bodySmooth, fps, 12, 4);
+        const aud2 = auditBeatsJS(pass2.cand, body, bodySmooth, fps);
+        if (aud2.bad_windows < audFollow.bad_windows
+          || (aud2.bad_windows === audFollow.bad_windows && aud2.max_offset_ms < audFollow.max_offset_ms - 2.0)) {
+          candFollow = pass2.cand;
+          activeMask = pass2.activeMask;
+          audFollow = aud2;
+        }
+      }
+
+      fixed = candFollow;
+      action = pass.winCount >= 2 ? "drift_tracked" : (pass.winCount === 1 ? "phase_shifted" : "verified");
+
+      if (pass.winCount >= 2 && candFollow.length >= 8) {
+        const fit = fitIrlsStraight(candFollow, activeMask);
+        if (fit) {
+          const audStraight = auditBeatsJS(fit.candStraight, body, bodySmooth, fps);
+          if (
+            fit.straightDev <= 14.0
+            && audStraight.median_offset_ms <= Math.max(10.0, audFollow.median_offset_ms + 4.0)
+            && audStraight.bad_windows <= audFollow.bad_windows
+          ) {
+            fixed = fit.candStraight;
+            action = "steady_locked";
+          } else {
+            const evened = evenInactiveGaps(candFollow, activeMask);
+            const smoothed = smoothDriftBeats(evened);
+            const audSm = auditBeatsJS(smoothed, body, bodySmooth, fps);
+            fixed = audSm.bad_windows <= audFollow.bad_windows ? smoothed : evened;
+            action = "drift_tracked";
+          }
         }
       }
     }
@@ -1310,6 +1366,227 @@
         outR[i] = right[i1] * (1 - t) + right[i1 + 1] * t;
       }
     }
+    return { left: outL, right: outR };
+  }
+
+  // ------------------------------------------------------------------ Rubber Band R3 WebAssembly (Pitch-Preserving Time-Stretch + Click-Pilot!)
+
+  const RB_WASM_KEY = "rubberband_wasm_330";
+  const RB_ESM_URL = "https://cdn.jsdelivr.net/npm/rubberband-wasm@3.3.0/dist/index.esm.min.js";
+  const RB_WASM_URL = "https://cdn.jsdelivr.net/npm/rubberband-wasm@3.3.0/dist/rubberband.wasm";
+  let rbLoadPromise = null;
+
+  async function ensureRubberBandR3() {
+    if (rbLoadPromise) return rbLoadPromise;
+    rbLoadPromise = (async () => {
+      const { RubberBandInterface, RubberBandOption } = await import(RB_ESM_URL);
+      let wasmBuf = null;
+      try { wasmBuf = await dbGet("models", RB_WASM_KEY); } catch {}
+      if (!wasmBuf) {
+        const resp = await fetch(RB_WASM_URL);
+        if (!resp.ok) throw new Error(`Rubber Band WASM download failed (HTTP ${resp.status})`);
+        wasmBuf = await resp.arrayBuffer();
+        try { await dbPut("models", wasmBuf, RB_WASM_KEY); } catch {}
+      }
+      const wasmMod = await WebAssembly.compile(wasmBuf);
+      const rb = await RubberBandInterface.initialize(wasmMod);
+      return { rb, opt: RubberBandOption };
+    })().catch((err) => {
+      rbLoadPromise = null;
+      throw err;
+    });
+    return rbLoadPromise;
+  }
+
+  function ratioAtSample(pos, srcS, dstS) {
+    const nb = srcS.length;
+    if (nb < 2) return 1.0;
+    if (pos <= srcS[0]) return Math.max(0.5, Math.min(2.0, (dstS[1] - dstS[0]) / Math.max(1, srcS[1] - srcS[0])));
+    if (pos >= srcS[nb - 1]) return Math.max(0.5, Math.min(2.0, (dstS[nb - 1] - dstS[nb - 2]) / Math.max(1, srcS[nb - 1] - srcS[nb - 2])));
+    let lo = 0, hi = nb - 2;
+    while (lo < hi) {
+      const mid = (lo + hi + 1) >> 1;
+      if (srcS[mid] <= pos) lo = mid; else hi = mid - 1;
+    }
+    return Math.max(0.5, Math.min(2.0, (dstS[lo + 1] - dstS[lo]) / Math.max(1, srcS[lo + 1] - srcS[lo])));
+  }
+
+  function rbOptionsForStem(opt, stem) {
+    let flags = opt.RubberBandOptionProcessRealTime
+      | opt.RubberBandOptionThreadingNever
+      | opt.RubberBandOptionChannelsTogether
+      | opt.RubberBandOptionEngineFiner
+      | opt.RubberBandOptionPitchHighQuality
+      | (stem === "drums" ? opt.RubberBandOptionTransientsCrisp : opt.RubberBandOptionTransientsMixed);
+    if (stem === "vocals") flags |= opt.RubberBandOptionFormantPreserved;
+    return flags;
+  }
+
+  async function runR3RealTime(rb, channels, getRatioAt, optsFlags, pitchScale = 1.0, sr = SR, onFrac = null) {
+    const nCh = channels.length;
+    const nS = channels[0].length;
+    const st = rb.rubberband_new(sr, nCh, optsFlags, getRatioAt(0), pitchScale);
+    const startPad = rb.rubberband_get_preferred_start_pad(st);
+    const startDelay = rb.rubberband_get_start_delay(st);
+    const block = 512;
+    rb.rubberband_set_max_process_size(st, block);
+
+    const chArr = rb.malloc(nCh * 4);
+    const ptrs = [];
+    for (let c = 0; c < nCh; c++) {
+      const p = rb.malloc(block * 4);
+      ptrs.push(p);
+      rb.memWritePtr(chArr + c * 4, p);
+    }
+    const z = new Float32Array(block);
+    const chunks = Array.from({ length: nCh }, () => []);
+    let tot = 0;
+    const drain = () => {
+      let a;
+      while ((a = rb.rubberband_available(st)) > 0) {
+        const g = rb.rubberband_retrieve(st, chArr, Math.min(block, a));
+        if (g <= 0) break;
+        for (let c = 0; c < nCh; c++) chunks[c].push(new Float32Array(rb.memReadF32(ptrs[c], g)));
+        tot += g;
+      }
+    };
+
+    try {
+      for (let rem = startPad; rem > 0; rem -= block) {
+        const l = Math.min(block, rem);
+        for (let c = 0; c < nCh; c++) rb.memWrite(ptrs[c], z.subarray(0, l));
+        rb.rubberband_process(st, chArr, l, 0);
+        drain();
+      }
+      let iter = 0;
+      for (let pos = 0; pos < nS; pos += block) {
+        const l = Math.min(block, nS - pos);
+        rb.rubberband_set_time_ratio(st, getRatioAt(pos + l * 0.5));
+        for (let c = 0; c < nCh; c++) rb.memWrite(ptrs[c], channels[c].subarray(pos, pos + l));
+        rb.rubberband_process(st, chArr, l, pos + l >= nS ? 1 : 0);
+        drain();
+        if ((++iter & 127) === 0) {
+          if (onFrac) onFrac(pos / Math.max(1, nS));
+          await tick();
+        }
+      }
+    } finally {
+      rb.rubberband_delete(st);
+      for (const p of ptrs) rb.free(p);
+      rb.free(chArr);
+    }
+
+    const outLen = Math.max(1, tot - startDelay);
+    const out = Array.from({ length: nCh }, () => new Float32Array(outLen));
+    for (let c = 0; c < nCh; c++) {
+      let skip = startDelay, dst = 0;
+      for (const ch of chunks[c]) {
+        if (skip >= ch.length) { skip -= ch.length; continue; }
+        const sl = skip > 0 ? ch.subarray(skip) : ch;
+        skip = 0;
+        const copyLen = Math.min(sl.length, outLen - dst);
+        out[c].set(sl.subarray(0, copyLen), dst);
+        dst += copyLen;
+      }
+    }
+    return out;
+  }
+
+  async function measurePilotR3(rb, nS, srcB, dstB, optsFlags) {
+    const srcS = srcB.map((x) => x * SR);
+    const dstS = dstB.map((x) => x * SR);
+    const pilot = new Float32Array(nS);
+    const click = [1.0, 0.8, 0.5, 0.25];
+    for (let j = 0; j < srcS.length; j++) {
+      const idx = Math.round(srcS[j]);
+      if (idx >= 0 && idx < nS - 8) {
+        for (let k = 0; k < 4; k++) pilot[idx + k] += click[k];
+      }
+    }
+    const [pOut] = await runR3RealTime(rb, [pilot], (p) => ratioAtSample(p, srcS, dstS), optsFlags, 1.0, SR);
+    const nP = pOut.length;
+    const env = new Float32Array(nP);
+    let run = 0;
+    for (let i = 0; i < nP; i++) {
+      run += pOut[i] * pOut[i];
+      if (i >= 32) run -= pOut[i - 32] * pOut[i - 32];
+      env[i] = run / 32;
+    }
+    const per = medianDiff(dstB);
+    const win = Math.max(Math.round(0.02 * SR), Math.min(Math.round(0.3 * SR), Math.round(0.3 * per * SR)));
+    const rawMeas = [];
+    let drift = 0;
+    for (let j = 0; j < dstS.length; j++) {
+      const c = dstS[j] + 16 + drift;
+      const a = Math.max(1, Math.floor(c - win));
+      const e = Math.min(nP - 2, Math.floor(c + win));
+      if (e <= a + 2) continue;
+      let pk = a;
+      for (let i = a + 1; i < e; i++) if (env[i] > env[pk]) pk = i;
+      if (env[pk] <= 1e-6) continue;
+      const measured = pk - 16;
+      drift = measured - dstS[j];
+      rawMeas.push({ mS: measured / SR, dS: dstB[j], err: (measured - dstS[j]) / SR });
+    }
+    // 5-point median outlier filter on pilot drift (matching quantize.py)
+    const measB = [], goodDstB = [];
+    for (let i = 0; i < rawMeas.length; i++) {
+      const winErr = [];
+      for (let k = -2; k <= 2; k++) winErr.push(rawMeas[Math.max(0, Math.min(rawMeas.length - 1, i + k))].err);
+      if (Math.abs(rawMeas[i].err - medianOf(winErr)) < 0.06) {
+        measB.push(rawMeas[i].mS);
+        goodDstB.push(rawMeas[i].dS);
+      }
+    }
+    return { measB, goodDstB };
+  }
+
+  async function stretchBeatsR3Wasm(inL, inR, srcB, dstB, stem, pilotCache, onFrac = null) {
+    // Fast-path: if beats are already steady (<0.12% deviation), skip R3 completely (zero artifacts!)
+    let maxDev = 0;
+    for (let j = 0; j < srcB.length - 1; j++) {
+      const r = (dstB[j + 1] - dstB[j]) / Math.max(1e-6, srcB[j + 1] - srcB[j]);
+      const d = Math.abs(r - 1.0);
+      if (d > maxDev) maxDev = d;
+    }
+    if (maxDev < 0.0012) {
+      return { ...resampleTimeMap(inL, inR, srcB, dstB, SR), method: "steady-copy" };
+    }
+
+    const { rb, opt } = await ensureRubberBandR3();
+    const optsFlags = rbOptionsForStem(opt, stem);
+    const srcS = srcB.map((x) => x * SR);
+    const dstS = dstB.map((x) => x * SR);
+    const [rawL, rawR] = await runR3RealTime(
+      rb,
+      [inL, inR],
+      (p) => ratioAtSample(p, srcS, dstS),
+      optsFlags,
+      1.0,
+      SR,
+      onFrac,
+    );
+
+    const pKey = `${optsFlags}|${inL.length}`;
+    if (!pilotCache.has(pKey)) {
+      pilotCache.set(pKey, await measurePilotR3(rb, inL.length, srcB, dstB, optsFlags));
+    }
+    const { measB, goodDstB } = pilotCache.get(pKey);
+    if (measB.length >= 4) {
+      return { ...resampleTimeMap(rawL, rawR, measB, goodDstB, SR), method: "r3-wasm" };
+    }
+    return { left: rawL, right: rawR, method: "r3-wasm" };
+  }
+
+  async function stretchSegmentR3(inL, inR, timeRatio = 1.0, semis = 0.0, stem = "other", sr = SR) {
+    const ratio = Math.max(0.25, Math.min(4.0, Number(timeRatio || 1.0)));
+    const pitchScale = Math.pow(2, Math.max(-12, Math.min(12, Number(semis || 0))) / 12);
+    if (Math.abs(ratio - 1.0) < 0.002 && Math.abs(pitchScale - 1.0) < 0.001) {
+      return { left: inL, right: inR };
+    }
+    const { rb, opt } = await ensureRubberBandR3();
+    const optsFlags = rbOptionsForStem(opt, stem);
+    const [outL, outR] = await runR3RealTime(rb, [inL, inR], () => ratio, optsFlags, pitchScale, sr);
     return { left: outL, right: outR };
   }
 
@@ -1670,14 +1947,34 @@
     const rev = `Q_${g.sig}_${Math.floor(Date.now() / 1000)}`;
 
     const rendered = {};
+    const pilotCache = new Map();
+    let usedMethod = "r3-wasm";
     for (let k = 0; k < STEMS.length; k++) {
       const st = STEMS[k];
-      onProgress(0.08 + 0.72 * (k / 4), `Quantizing ${st} (${k + 1}/4)...`);
+      const baseProg = 0.06 + 0.78 * (k / 4);
+      onProgress(baseProg, `Rubber Band R3 WASM: ${st} (${k + 1}/4)...`);
       await tick();
       const blob = await dbGet("blobs", `${sid}|raw|${st}`);
       if (!blob) throw new Error(`Missing local stem blob for ${st}`);
       const dec = await decodeTo44kStereo(await blob.arrayBuffer());
-      rendered[st] = resampleTimeMap(dec.left, dec.right, beats, dstBeats, SR);
+      // Skip R3 completely on silent stems (e.g. Direct Import zero-filled stems!)
+      if (arrayRms(dec.left) < 1e-5 && arrayRms(dec.right) < 1e-5) {
+        const lastSrc = beats[beats.length - 1], lastDst = dstBeats[dstBeats.length - 1];
+        const slopeEnd = (beats[beats.length - 1] - beats[beats.length - 2]) / Math.max(1e-6, dstBeats[dstBeats.length - 1] - dstBeats[dstBeats.length - 2]);
+        const nOut = Math.max(1, Math.ceil((lastDst + (dec.left.length / SR - lastSrc) / Math.max(0.25, slopeEnd)) * SR));
+        rendered[st] = { left: new Float32Array(nOut), right: new Float32Array(nOut), method: "silent" };
+        continue;
+      }
+      try {
+        rendered[st] = await stretchBeatsR3Wasm(dec.left, dec.right, beats, dstBeats, st, pilotCache, (frac) => {
+          onProgress(baseProg + 0.18 * frac, `Rubber Band R3 WASM: ${st} (${k + 1}/4 · ${Math.round(frac * 100)}%)...`);
+        });
+        if (st === "drums" || usedMethod === "r3-wasm") usedMethod = rendered[st].method || "r3-wasm";
+      } catch (err) {
+        console.warn("Rubber Band R3 WASM unavailable, falling back to resampler:", err);
+        rendered[st] = { ...resampleTimeMap(dec.left, dec.right, beats, dstBeats, SR), method: "varispeed" };
+        usedMethod = "varispeed";
+      }
     }
 
     // Align lengths across all 4 quantized stems & normalize peak safely if > 0.98
@@ -1749,11 +2046,12 @@
       n_samples: nMin,
       n_beats: dstBeats.length,
       scale,
+      method: usedMethod,
       audit: qAud,
       created: Date.now() / 1000,
     };
     await saveLocalGridToDB(sid, g);
-    onProgress(1.0, `Quantized & verified (${qAud.median_offset_ms.toFixed(1)} ms)`);
+    onProgress(1.0, `Quantized (${usedMethod}) & verified (${qAud.median_offset_ms.toFixed(1)} ms)`);
     return g;
   }
 
@@ -1776,6 +2074,7 @@
     autoFixLocalGrid,
     updateLocalGrid,
     quantizeLocalSong,
+    stretchSegmentR3,
     getAllLocalSongs: () => dbGetAll("songs"),
     getBlob: (key) => dbGet("blobs", key),
     // Exposed pure-DSP helpers for verification/benchmarking

@@ -599,10 +599,15 @@ function scheduleClipsFrom(startBeat) {
     }
 
     const totalSemis = clipTotalSemis(c);
-    if (!warpEntry && pitchWorkletReady && Math.abs(totalSemis) > 0.01) {
+    // Keep tonal stems locked to original key while Web Audio playbackRate plays instant preview
+    const rateCompSemis = (!warpEntry && c.stem !== "drums" && Math.abs(pbRate - 1.0) > 0.012)
+      ? -12 * Math.log2(pbRate)
+      : 0;
+    const effSemis = totalSemis + rateCompSemis;
+    if (!warpEntry && pitchWorkletReady && Math.abs(effSemis) > 0.05) {
       try {
         const pn = new AudioWorkletNode(ac, "retex-pitch", { numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [2] });
-        pn.parameters.get("semis").setValueAtTime(Math.max(-12, Math.min(12, totalSemis)), when);
+        pn.parameters.get("semis").setValueAtTime(Math.max(-12, Math.min(12, effSemis)), when);
         src.connect(pn);
         pn.connect(cg);
       } catch {

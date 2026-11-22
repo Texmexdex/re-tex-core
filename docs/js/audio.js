@@ -599,10 +599,15 @@ function scheduleClipsFrom(startBeat) {
     }
 
     const totalSemis = clipTotalSemis(c);
-    if (!warpEntry && pitchWorkletReady && Math.abs(totalSemis) > 0.01) {
+    // Keep tonal stems locked to original key when Web Audio playbackRate tempo-matches in preview / Browser-Local mode!
+    const rateCompSemis = (!warpEntry && c.stem !== "drums" && Math.abs(pbRate - 1.0) > 0.012)
+      ? -12 * Math.log2(pbRate)
+      : 0;
+    const effSemis = totalSemis + rateCompSemis;
+    if (!warpEntry && pitchWorkletReady && Math.abs(effSemis) > 0.05) {
       try {
         const pn = new AudioWorkletNode(ac, "retex-pitch", { numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [2] });
-        pn.parameters.get("semis").setValueAtTime(Math.max(-12, Math.min(12, totalSemis)), when);
+        pn.parameters.get("semis").setValueAtTime(Math.max(-12, Math.min(12, effSemis)), when);
         src.connect(pn);
         pn.connect(cg);
       } catch {
@@ -959,12 +964,38 @@ export async function renderOfflineWav(project) {
     const mult = songMult(c.song);
     const rate = Number(c.rate || 1.0);
     const pbRate = Math.max(0.25, Math.min(4.0, (pSrc / (secPerBeat * mult)) * rate));
+    const totalSemis = clipTotalSemis(c);
     const when = Math.max(0, c.start * secPerBeat);
     const durWall = c.len * secPerBeat;
-    const offSec = Math.max(0, t0Src + Number(c.src) * pSrc);
+    let offSec = Math.max(0, t0Src + Number(c.src) * pSrc);
+    let playBuf = ent.buffer;
+    let playRate = pbRate;
+
+    // Use Rubber Band R3 WASM for pitch-preserving tempo-match & real key shift in Browser-Local WAV export!
+    if (window.RetexBrowserDSP?.stretchSegmentR3 && (Math.abs(pbRate - 1.0) > 0.004 || Math.abs(totalSemis) > 0.01)) {
+      try {
+        const bufSr = ent.buffer.sampleRate || sr;
+        const i0 = Math.max(0, Math.min(ent.buffer.length - 1, Math.floor(offSec * bufSr)));
+        const needSrc = Math.min(ent.buffer.length - i0, Math.ceil((durWall * pbRate + 0.12) * bufSr));
+        if (needSrc > 64) {
+          const ch0 = ent.buffer.getChannelData(0).subarray(i0, i0 + needSrc);
+          const ch1 = (ent.buffer.numberOfChannels > 1 ? ent.buffer.getChannelData(1) : ent.buffer.getChannelData(0)).subarray(i0, i0 + needSrc);
+          const st = await window.RetexBrowserDSP.stretchSegmentR3(ch0, ch1, 1.0 / pbRate, totalSemis, c.stem, bufSr);
+          const nb = off.createBuffer(2, st.left.length, bufSr);
+          nb.copyToChannel(st.left, 0);
+          nb.copyToChannel(st.right, 1);
+          playBuf = nb;
+          playRate = 1.0;
+          offSec = 0;
+        }
+      } catch (e) {
+        console.warn("R3 export stretch fallback:", e);
+      }
+    }
+
     const s = off.createBufferSource();
-    s.buffer = ent.buffer;
-    s.playbackRate.value = pbRate;
+    s.buffer = playBuf;
+    s.playbackRate.value = playRate;
     const cg = off.createGain();
     const baseG = Math.pow(10, Number(c.gain_db || 0) / 20) * (ent.scale > 1e-5 ? 1 / ent.scale : 1);
     const fi = Math.max(0.004, Number(c.fade_in || 0) * secPerBeat);
