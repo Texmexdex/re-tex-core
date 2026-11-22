@@ -280,40 +280,56 @@ def audit_beats(beats, body, fps, win_beats=16, step_beats=8):
 # ------------------------------------------------------------------ transient-locked auto-fix
 
 def _recount_slips(beats):
-    """Fix 2x / 0.5x detector tempo switches, huge missed-beat gaps, and glitch sub-beats (<0.38x)."""
+    """Fix 2x / 0.5x detector tempo switches, missed-beat gaps, and isolated glitch sub-beats using local tempo."""
     b = np.asarray(beats, float)
     if len(b) < 12:
         return b
-    iv = np.diff(b)
-    p0 = float(np.median(iv))
-    if p0 <= 0.05:
-        return b
-    out = [float(b[0])]
-    i = 1
-    while i < len(b):
-        d = float(b[i]) - out[-1]
-        # Glitch burst / 3x+ over-counting (e.g. Beat This! 0.13s glitch on tom fills): skip until normal beat spacing!
-        if d < 0.38 * p0:
-            i += 1
-            continue
-        # Double-time pair (two ~0.5x beats where one beat belongs)
-        if 0.38 * p0 <= d <= 0.58 * p0 and i + 1 < len(b):
-            d2 = float(b[i + 1]) - float(b[i])
-            if 0.38 * p0 <= d2 <= 0.62 * p0:
-                out.append(float(b[i + 1]))
-                i += 2
+    for _ in range(2):
+        iv = np.diff(b)
+        p_glob = float(np.median(iv))
+        if p_glob <= 0.05 or len(b) < 12:
+            return b
+        # Local tempo estimate around every beat (+-8 beats) so real section tempo shifts stay intact
+        loc_p = np.empty(len(b), float)
+        for k in range(len(b)):
+            lo = max(0, k - 8)
+            hi = min(len(iv), k + 8)
+            loc_p[k] = float(np.median(iv[lo:hi])) if hi > lo else p_glob
+        out = [float(b[0])]
+        i = 1
+        while i < len(b):
+            d = float(b[i]) - out[-1]
+            # If Beat This! temporarily doubled into a 2x burst (loc_p < 0.62 * p_glob), anchor to p_glob!
+            p_loc = float(loc_p[i])
+            if p_loc < 0.62 * p_glob:
+                p_loc = p_glob
+            p_loc = max(0.18, p_loc)
+            # Split beat or isolated glitch sub-beat (<0.62x local period, e.g. 244-352 BPM stray/double beat)
+            if d < 0.62 * p_loc:
+                if i + 1 < len(b):
+                    d2 = float(b[i + 1]) - float(b[i])
+                    if 0.72 * p_loc <= (d + d2) <= 1.38 * p_loc:
+                        # Two sub-beats summing to ~1 real beat -> merge into the real beat
+                        out.append(float(b[i + 1]))
+                        i += 2
+                        continue
+                if d < 0.60 * p_loc:
+                    # Isolated stray glitch beat -> drop it!
+                    i += 1
+                    continue
+            # Missed beats / half-time gap (>= 1.58x local period): subdivide evenly
+            if d >= 1.58 * p_loc:
+                n_sub = max(2, int(round(d / p_loc)))
+                prev = out[-1]
+                for k in range(1, n_sub):
+                    out.append(prev + d * k / n_sub)
+                out.append(float(b[i]))
+                i += 1
                 continue
-        # Missed beats / half-time gap (>= 1.75x): subdivide evenly at ~p0
-        if d >= 1.75 * p0:
-            n_sub = max(2, int(round(d / p0)))
-            for k in range(1, n_sub):
-                out.append(out[-1] + d / n_sub)
             out.append(float(b[i]))
             i += 1
-            continue
-        out.append(float(b[i]))
-        i += 1
-    return np.asarray(out, float)
+        b = np.asarray(out, float)
+    return b
 
 
 def _pick_downbeat_offset(beats, kick, snare, fps, bpb, ref_bars_t=None):
@@ -451,8 +467,8 @@ def build_verified_grid(sid):
             else:
                 # Re-even out any inactive (drumless) interior stretches between active anchors
                 fixed = _even_inactive_gaps(cand_follow, active_mask)
-                # One final fine pass (+-12 ms local snap onto sharpest hit only on active beats)
-                fixed = _gentle_hit_snap(fixed, active_mask, body, fps, max_shift_s=0.012)
+                # Gentle +-5 ms transient lock (never introduces beat-to-beat speed whiplash)
+                fixed = _gentle_hit_snap(fixed, active_mask, body, fps, max_shift_s=0.005)
                 action = "drift_tracked"
     elif len(win_centers) == 1:
         off_s = float(_DELTAS[int(np.argmax(win_curves[0]))] * p_med)

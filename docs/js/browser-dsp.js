@@ -1528,17 +1528,51 @@
       drift = measured - dstS[j];
       rawMeas.push({ mS: measured / SR, dS: dstB[j], err: (measured - dstS[j]) / SR });
     }
-    // 5-point median outlier filter on pilot drift (matching quantize.py)
-    const measB = [], goodDstB = [];
+    // 7-point median outlier filter + 9-beat Hann smooth + strict +-0.8% slope clamp (<=13.8 cents, 100% inaudible!)
+    const keepD = [], keepE = [];
     for (let i = 0; i < rawMeas.length; i++) {
       const winErr = [];
-      for (let k = -2; k <= 2; k++) winErr.push(rawMeas[Math.max(0, Math.min(rawMeas.length - 1, i + k))].err);
-      if (Math.abs(rawMeas[i].err - medianOf(winErr)) < 0.06) {
-        measB.push(rawMeas[i].mS);
-        goodDstB.push(rawMeas[i].dS);
+      for (let k = -3; k <= 3; k++) winErr.push(rawMeas[Math.max(0, Math.min(rawMeas.length - 1, i + k))].err);
+      if (Math.abs(rawMeas[i].err - medianOf(winErr)) < 0.025) {
+        keepD.push(rawMeas[i].dS);
+        keepE.push(rawMeas[i].err);
       }
     }
-    return { measB, goodDstB };
+    if (keepD.length < 4) return { measB: [], goodDstB: [] };
+    // Interpolate onto every dstB[j]
+    const errAll = new Float64Array(dstB.length);
+    let seg = 0;
+    for (let j = 0; j < dstB.length; j++) {
+      const d = dstB[j];
+      if (d <= keepD[0]) { errAll[j] = keepE[0]; continue; }
+      if (d >= keepD[keepD.length - 1]) { errAll[j] = keepE[keepE.length - 1]; continue; }
+      while (seg < keepD.length - 2 && keepD[seg + 1] < d) seg++;
+      const u = (d - keepD[seg]) / Math.max(1e-6, keepD[seg + 1] - keepD[seg]);
+      errAll[j] = keepE[seg] + u * (keepE[seg + 1] - keepE[seg]);
+    }
+    // 9-beat Hann smooth
+    const errSm = new Float64Array(dstB.length);
+    const ker = [0.0955, 0.3455, 0.6545, 0.9045, 1.0, 0.9045, 0.6545, 0.3455, 0.0955];
+    const kSum = ker.reduce((a, b) => a + b, 0);
+    for (let j = 0; j < dstB.length; j++) {
+      let acc = 0;
+      for (let k = -4; k <= 4; k++) acc += errAll[Math.max(0, Math.min(dstB.length - 1, j + k))] * ker[k + 4];
+      errSm[j] = acc / kSum;
+    }
+    // Bidirectional +-0.8% slope clamp
+    const maxSlope = 0.008;
+    const fwd = Float64Array.from(errSm);
+    for (let j = 1; j < fwd.length; j++) {
+      const lim = maxSlope * Math.max(1e-4, dstB[j] - dstB[j - 1]);
+      fwd[j] = Math.max(fwd[j - 1] - lim, Math.min(fwd[j - 1] + lim, fwd[j]));
+    }
+    const bwd = Float64Array.from(errSm);
+    for (let j = bwd.length - 2; j >= 0; j--) {
+      const lim = maxSlope * Math.max(1e-4, dstB[j + 1] - dstB[j]);
+      bwd[j] = Math.max(bwd[j + 1] - lim, Math.min(bwd[j + 1] + lim, bwd[j]));
+    }
+    const measB = dstB.map((d, j) => d + 0.5 * (fwd[j] + bwd[j]));
+    return { measB, goodDstB: [...dstB] };
   }
 
   async function stretchBeatsR3Wasm(inL, inR, srcB, dstB, stem, pilotCache, onFrac = null) {

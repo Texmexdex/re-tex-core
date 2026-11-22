@@ -139,6 +139,34 @@ def _measure_pilot(f, n_in, src_s, dst_s, semis, opts):
     return res, ok
 
 
+def _smooth_pilot_map(meas, good, dst_s, max_slope=0.008):
+    """Smooth R3 pilot drift and strictly clamp slope <= +-0.8% (+-13.8 cents max, completely inaudible!)."""
+    err = meas[good] - dst_s[good]
+    trend = median_filter(err, size=7, mode="nearest")
+    keep = np.abs(err - trend) < 0.025 * SR
+    if keep.sum() < 4:
+        return None
+    d_keep = dst_s[good][keep]
+    e_keep = err[keep]
+    err_all = np.interp(dst_s, d_keep, e_keep)
+    # 9-beat Hann smooth removes single-beat pilot click jitter while preserving cumulative R3 drift
+    if len(err_all) >= 9:
+        ker = np.hanning(11)[1:-1]
+        ker /= ker.sum()
+        err_all = np.convolve(np.pad(err_all, 4, mode="edge"), ker, mode="valid")[:len(err_all)]
+    # Symmetric bidirectional slope clamp (guarantees varispeed micro-trim never bends audible pitch!)
+    fwd = err_all.copy()
+    for j in range(1, len(fwd)):
+        lim = max_slope * max(1.0, dst_s[j] - dst_s[j - 1])
+        fwd[j] = np.clip(fwd[j], fwd[j - 1] - lim, fwd[j - 1] + lim)
+    bwd = err_all.copy()
+    for j in range(len(bwd) - 2, -1, -1):
+        lim = max_slope * max(1.0, dst_s[j + 1] - dst_s[j])
+        bwd[j] = np.clip(bwd[j], bwd[j + 1] - lim, bwd[j + 1] + lim)
+    err_clean = 0.5 * (fwd + bwd)
+    return dst_s + err_clean
+
+
 def stretch_beats_r3(y, src_beats_s, dst_beats_s, semis=0.0, stem="other"):
     """Warp stereo (2, n) audio so src_beats_s[j] lands sample-accurately at dst_beats_s[j] (seconds)."""
     n_in = y.shape[1]
@@ -160,12 +188,10 @@ def stretch_beats_r3(y, src_beats_s, dst_beats_s, semis=0.0, stem="other"):
     good = ok & np.isfinite(meas)
     if good.sum() < 4:
         return _fit_len(out, n_out), "r3-uncorrected"
-    err = meas[good] - dst_s[good]
-    trend = median_filter(err, size=5, mode="nearest")
-    keep = np.abs(err - trend) < 0.06 * SR
-    if keep.sum() < 4:
+    meas_clean = _smooth_pilot_map(meas, good, dst_s, max_slope=0.008)
+    if meas_clean is None:
         return _fit_len(out, n_out), "r3-uncorrected"
-    fixed = resample_map(out, meas[good][keep], dst_s[good][keep], n_out)
+    fixed = resample_map(out, meas_clean, dst_s, n_out)
     return fixed, "r3"
 
 
